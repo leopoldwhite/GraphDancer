@@ -10,6 +10,7 @@ GraphDancer: Training LLMs to Explore and Reason over Graphs via Curriculum Rein
 <p align="center">
     <a href="https://arxiv.org/abs/XXXX.XXXXX"><img src="https://img.shields.io/badge/arXiv-XXXX.XXXXX-B31B1B.svg?logo=arxiv" alt="arXiv"></a>
     <a href="https://huggingface.co/collections/yuyangbai/graphdancer"><img src="https://img.shields.io/badge/Huggingface-Model-FFD21E.svg?logo=huggingface" alt="Huggingface Model"></a>
+    <a href="https://yuyangbai.com/graphdancer/"><img src="https://img.shields.io/badge/Website-GraphDancer-E5426E?logo=googlechrome" alt="Website"></a>
 </p>
 <!--- BADGES: END --->
 
