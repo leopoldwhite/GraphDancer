@@ -1,0 +1,387 @@
+#! Graph-RL → VERL: PPO-format config (aligned to Graph-RL defaults)
+
+defaults:
+  - actor@actor_rollout_ref.actor: dp_actor
+  - data@data: legacy_data
+  - ref@actor_rollout_ref.ref: dp_ref
+  - rollout@actor_rollout_ref.rollout: rollout
+  - model@actor_rollout_ref.model: hf_model
+  - critic@critic: dp_critic
+  - reward_model@reward_model: dp_reward_model
+  - _self_
+
+data:
+  tokenizer: null
+  # Avoid bare '~' in defaults; use ${oc.env:HOME}
+  train_files: ${oc.env:DATA_DIR,${oc.env:HOME}/data/rlhf/gsm8k}/train.parquet
+  val_files: ${oc.env:DATA_DIR,${oc.env:HOME}/data/rlhf/gsm8k}/test.parquet
+  train_data_num: null
+  val_data_num: null
+  prompt_key: prompt
+  max_prompt_length: 512
+  max_response_length: 512
+  max_start_length: 256
+  max_obs_length: 512
+  train_batch_size: 1024
+  val_batch_size: 1312
+  return_raw_input_ids: false
+  return_raw_chat: false
+  # Graph-RL uses shuffle_train_dataloader; keep both for compatibility
+  shuffle_train_dataloader: true
+  shuffle: ${data.shuffle_train_dataloader}
+  # Curriculum (E2H) knobs
+  use_e2h: false
+  e2h_sampler: gaussian   # gaussian | cosine
+  difficulty_key: "extra_info.difficulty"
+  buckets: ["easy", "medium", "hard"]
+  e2h_beta: 0.25
+  e2h_sigma: 0.75
+  e2h_eps: 1.0e-8
+  # VERL dataloader settings
+  dataloader_num_workers: 8
+  sampler:
+    class_path: null
+    class_name: null
+
+actor_rollout_ref:
+  hybrid_engine: true
+
+  # Timeout for operations executed against the process group
+  nccl_timeout: 600
+
+  model:
+    # Use HOME instead of '~' to avoid parser issues
+    path: ${oc.env:BASE_MODEL,${oc.env:HOME}/models/deepseek-llm-7b-chat}
+    external_lib: null
+    override_config: { }
+    enable_gradient_checkpointing: false
+    use_remove_padding: false
+  actor:
+    strategy: fsdp
+    ppo_mini_batch_size: 256
+    # Prefer per-GPU micro batch; keep global one null to avoid conflicts with CLI
+    ppo_micro_batch_size: null
+    ppo_micro_batch_size_per_gpu: null
+    use_dynamic_bsz: false
+    ppo_max_token_len_per_gpu: 16384 # n * ${data.max_prompt_length} + ${data.max_response_length}
+    grad_clip: 1.0
+    clip_ratio: 0.2
+    entropy_coeff: 0.001
+    use_kl_loss: false # True for GRPO
+    kl_loss_coef: 0.001 # for grpo
+    kl_loss_type: low_var_kl # for grpo
+    ppo_epochs: 1
+    shuffle: false
+    ulysses_sequence_parallel_size: 1 # sp size
+    optim:
+      lr: 1e-6
+      lr_warmup_steps_ratio: 0.  # injected at runtime if needed
+      min_lr_ratio: null
+      warmup_style: constant
+      total_training_steps: -1
+    fsdp_config:
+      wrap_policy:
+        min_num_params: 0
+      param_offload: false
+      optimizer_offload: false
+      fsdp_size: -1
+  ref:
+    fsdp_config:
+      param_offload: false
+      wrap_policy:
+        min_num_params: 0
+      fsdp_size: -1
+    log_prob_micro_batch_size: 128
+    log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
+    log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
+    ulysses_sequence_parallel_size: ${actor_rollout_ref.actor.ulysses_sequence_parallel_size}
+  rollout:
+    # for huge model, layered summon can save memory (prevent OOM) but make it slower
+    layered_summon: False
+
+    name: vllm
+    temperature: 0.7
+    top_k: 20 # 0 for hf rollout, -1 for vllm rollout
+    top_p: 0.8
+    prompt_length: ${data.max_prompt_length}
+    response_length: ${data.max_response_length}
+    dtype: bfloat16
+    gpu_memory_utilization: 0.5
+    ignore_eos: false
+    enforce_eager: true
+    free_cache_engine: true
+    load_format: dummy_dtensor
+    tensor_model_parallel_size: 2
+    max_num_batched_tokens: 8192
+    max_num_seqs: 1024
+    log_prob_micro_batch_size: 128
+    log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
+    log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
+    do_sample: true
+    n: 1 # > 1 for grpo
+    # validation knobs (VERL expects val_kwargs)
+    val_kwargs:
+      n: 1
+      do_sample: false
+
+critic:
+  strategy: fsdp
+  optim:
+    lr: 1e-5
+    lr_warmup_steps_ratio: 0.
+    min_lr_ratio: null
+    warmup_style: constant
+    total_training_steps: -1
+  model:
+    path: ${actor_rollout_ref.model.path}
+    tokenizer_path: ${actor_rollout_ref.model.path}
+    override_config: { }
+    external_lib: ${actor_rollout_ref.model.external_lib}
+    enable_gradient_checkpointing: false
+    use_remove_padding: false
+    fsdp_config:
+      param_offload: false
+      optimizer_offload: false
+      wrap_policy:
+        min_num_params: 0
+      fsdp_size: -1
+  ppo_mini_batch_size: ${actor_rollout_ref.actor.ppo_mini_batch_size}
+  ppo_micro_batch_size_per_gpu: 16
+  forward_micro_batch_size: ${critic.ppo_micro_batch_size_per_gpu}
+  use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
+  ppo_max_token_len_per_gpu: 32768 # (${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}) * 2
+  forward_max_token_len_per_gpu: ${critic.ppo_max_token_len_per_gpu}
+  ulysses_sequence_parallel_size: 1 # sp size
+  ppo_epochs: ${actor_rollout_ref.actor.ppo_epochs}
+  shuffle: ${actor_rollout_ref.actor.shuffle}
+  grad_clip: 1.0
+  cliprange_value: 0.5
+
+reward_model:
+  enable: false
+  strategy: fsdp
+  model:
+    input_tokenizer: ${actor_rollout_ref.model.path}
+    path: ${oc.env:HOME}/models/FsfairX-LLaMA3-RM-v0.1
+    external_lib: ${actor_rollout_ref.model.external_lib}
+    use_remove_padding: false
+    fsdp_config:
+      min_num_params: 0
+      param_offload: false
+  micro_batch_size: 64
+  max_length: null
+  ulysses_sequence_parallel_size: 1
+  use_dynamic_bsz: ${critic.use_dynamic_bsz}
+  forward_max_token_len_per_gpu: ${critic.forward_max_token_len_per_gpu}
+  structure_format_score: 0
+  final_format_score: 0
+  retrieval_score: 0
+
+retriever:
+  url: "http://127.0.0.1:8000/retrieve"
+  topk: 3
+
+# custom reward function definition
+custom_reward_function:
+  # The path to the file containing your customized reward function.
+  # If not specified, pre-implemented reward functions will be used.
+  path: null
+
+  # The name of the reward function within the specified file. Default is 'compute_score'.
+  name: compute_score
+
+algorithm:
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.trainer.config.AlgoConfig
+  gamma: 1.0
+  lam: 1.0
+  adv_estimator: gae
+  norm_adv_by_std_in_grpo: True
+  use_kl_in_reward: False
+  kl_penalty: kl
+  kl_ctrl:
+    _target_: verl.trainer.config.KLControlConfig
+    type: fixed
+    kl_coef: 0.001
+    horizon: 10000
+    target_kl: 0.1
+  use_pf_ppo: False
+  pf_ppo:
+    reweight_method: pow
+    weight_pow: 2.0
+  # Graph-RL agent setting
+  no_think_rl: false
+
+trainer:
+  # Whether to balance batch sizes across distributed workers
+  balance_batch: True
+  total_epochs: 50
+  total_training_steps: 200
+  project_name: ${oc.env:WAND_PROJECT,verl_examples}
+  experiment_name: ${oc.env:EXPERIMENT_NAME,gsm8k}
+  logger: ['console', 'wandb']
+  # Number of generations to log during validation
+  log_val_generations: 0
+  # Directory for logging rollout data; no dump if null
+  rollout_data_dir: null
+  # Directory for logging validation data; no dump if null
+  validation_data_dir: null
+  # Trace logging (eval/val only). When enabled, agent loop traces are written as:
+  # - JSONL: adds "trace" field into results.jsonl (per sample)
+  # - TXT:   writes per-sample logs into {trace_log_dir or results_dir}/logs/{qid|uid}.txt
+  trace_include_in_jsonl: true
+  trace_save_txt: false
+  # Additionally dump per-sample JSON for easy parsing: logs_json/{qid|uid}.json
+  trace_save_json: false
+  trace_skip_existing: true
+  # If null, defaults to the same folder as results.jsonl (./results/{experiment}/{domain}).
+  # If set, traces go to: {trace_log_dir}/{experiment}/{domain}/...
+  trace_log_dir: null
+  # Number of nodes used in the training
+  nnodes: 1
+
+  # Number of GPUs per node
+  n_gpus_per_node: 4
+  device: cuda
+  save_freq: -1
+
+  # ESI refers to the elastic server instance used during training, similar to the training plan. For example,
+  # if you purchase 10 hours of computing power, the ESI will automatically shut down after 10 hours of training.
+  # To ensure a checkpoint is saved before ESI shuts down, the system will start saving a checkpoint in advance.
+  # The advance time is calculated as: Advance Time = Longest historical step duration + Checkpoint save duration + esi_redundant_time.
+  # Here, esi_redundant_time is a user-defined value that further extends the advance time for added safety.
+  esi_redundant_time: 0
+
+  # Resume mode: "auto", "disable", or "resume_path"
+  # "auto": resume from last checkpoint if available
+  # "disable": start from scratch
+  # "resume_path": resume from a user-defined path
+  resume_mode: auto
+
+  # Path to resume training from (only used when resume_mode is "resume_path")
+  resume_from_path: null
+
+  # Whether to run validation before training begins
+  val_before_train: true
+
+  # Whether to run validation only
+  val_only: false
+  eval_only: false
+
+  # Validation frequency (in training iterations)
+  test_freq: -1
+
+  # Number of iterations to warm up the critic before updating policy
+  critic_warmup: 0
+
+  # Default path to distributed filesystem for saving checkpoints
+  default_hdfs_dir: ${oc.env:OUTPUT_DIR,${oc.env:HOME}/experiments/gsm8k/ppo}/${trainer.experiment_name}
+
+  # Whether to delete local checkpoints after loading
+  del_local_ckpt_after_load: False
+
+  # Default local directory for saving checkpoints
+  default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+
+  # Maximum number of actor checkpoints to keep
+  max_actor_ckpt_to_keep: null
+
+  # Maximum number of critic checkpoints to keep
+  max_critic_ckpt_to_keep: null
+
+  # Timeout (in seconds) for Ray worker to wait for registration
+  ray_wait_register_center_timeout: 300
+
+  # whether to use legacy worker implementation
+  #  mode: "auto", "enable", or "disable"
+  use_legacy_worker_impl: auto
+
+graph:
+  graph_dir: ${oc.env:GRAPH_DIR,./data/graphs}/biomedical/graph.json
+  dataset: biomedical
+  embedder_name: 'sentence-transformers/all-mpnet-base-v2'
+  faiss_gpu: false
+  embed_cache: true
+  embed_cache_dir: ${oc.env:GRAPH_DIR,./data/graphs}/biomedical
+  use_threaded: false
+  num_threads: 8
+  domains:
+    # dblp:
+    #   graph_dir: ${oc.env:GRAPH_DIR,./data/graphs}/dblp/graph.json
+    #   dataset: dblp
+    #   embed_cache_dir: ${oc.env:GRAPH_DIR,./data/graphs}/dblp
+    # maple_Biology:
+    #   graph_dir: ${oc.env:GRAPH_DIR}/maple/Biology/graph.json
+    #   dataset: maple
+    #   embed_cache_dir: ${oc.env:GRAPH_DIR}/maple/Biology
+    # maple_Chemistry:
+    #   graph_dir: ${oc.env:GRAPH_DIR}/maple/Chemistry/graph.json
+    #   dataset: maple
+    #   embed_cache_dir: ${oc.env:GRAPH_DIR}/maple/Chemistry
+    # maple_Medicine:
+    #   graph_dir: ${oc.env:GRAPH_DIR}/maple/Medicine/graph.json
+    #   dataset: maple
+    #   embed_cache_dir: ${oc.env:GRAPH_DIR}/maple/Medicine
+    # maple_Materials_Science:
+    #   graph_dir: ${oc.env:GRAPH_DIR}/maple/Materials_Science/graph.json
+    #   dataset: maple
+    #   embed_cache_dir: ${oc.env:GRAPH_DIR}/maple/Materials_Science
+    # maple_Physics:
+    #   graph_dir: ${oc.env:GRAPH_DIR}/maple/Physics/graph.json
+    #   dataset: maple
+    #   embed_cache_dir: ${oc.env:GRAPH_DIR}/maple/Physics
+    # biomedical:
+    #   graph_dir: ${oc.env:GRAPH_DIR}/biomedical/graph.json
+    #   dataset: biomedical
+    #   embed_cache_dir: ${oc.env:GRAPH_DIR}/biomedical
+    # amazon:
+    #   graph_dir: ${oc.env:GRAPH_DIR}/amazon/graph.json
+    #   dataset: amazon
+    #   embed_cache_dir: ${oc.env:GRAPH_DIR}/amazon
+    # goodreads:
+    #   graph_dir: ${oc.env:GRAPH_DIR}/goodreads/graph.json
+    #   dataset: goodreads
+    #   embed_cache_dir: ${oc.env:GRAPH_DIR}/goodreads
+    legal:
+      graph_dir: ${oc.env:GRAPH_DIR}/legal/graph.json
+      dataset: legal
+      embed_cache_dir: ${oc.env:GRAPH_DIR}/legal 
+
+
+max_turns: 10
+do_search: true
+
+# profiler configs (align with ppo_trainer.yaml)
+global_profiler:
+  _target_: verl.utils.profiler.ProfilerConfig
+  tool: null
+  steps: null
+  profile_continuous_steps: False
+  save_path: "outputs/profile"
+  global_tool_config:
+    nsys:
+      _target_: verl.utils.profiler.config.NsightToolConfig
+      discrete: False
+      controller_nsight_options:
+        trace: "cuda,nvtx,cublas,ucx"
+        cuda-memory-usage: "true"
+        cuda-graph-trace: "graph"
+      worker_nsight_options:
+        trace: "cuda,nvtx,cublas,ucx"
+        cuda-memory-usage: "true"
+        cuda-graph-trace: "graph"
+        capture-range: "cudaProfilerApi"
+        capture-range-end: null
+        kill: none
+    torch_memory:
+      trace_alloc_max_entries: 100_000
+      stack_depth: 32
+      context: "all"
+      stacks: "all"
+      kw_args: {}
+
+# ray related configs (optional, used by main_ppo_format.py)
+ray_kwargs:
+  ray_init:
+    num_cpus: null
+  timeline_json_file: null

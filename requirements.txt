@@ -1,0 +1,39 @@
+# GraphDancer requirements (portable; no local file paths or secrets).
+#
+# Notes:
+# - Install PyTorch separately to match your CUDA / ROCm environment.
+# - vLLM / SGLang / flash-attn are optional and hardware-dependent; see README for guidance.
+
+accelerate
+codetiming
+datasets
+dill
+hydra-core
+numpy<2.0.0
+pandas
+peft
+pyarrow>=19.0.0
+pybind11
+pylatexenc
+ray[default]>=2.41.0
+tensordict>=0.8.0,<=0.10.0,!=0.9.0
+torchdata
+transformers
+wandb
+packaging>=20.0
+tensorboard
+
+# Retrieval / rerank / service
+fastapi
+uvicorn
+sentence-transformers
+faiss-cpu
+
+# Evaluation utilities
+evaluate==0.3.0
+openai
+rouge_score
+nltk
+python-dotenv
+latex2sympy2_extended
+math_verify
