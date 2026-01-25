@@ -249,7 +249,7 @@ python eval.py --result_file results/biomedical/results.jsonl
 python eval.py --result_file results/biomedical/results.jsonl --use_gpt4_score
 ```
 
-## 🙏 Acknowledgements
+## Acknowledgements
 
 This project builds upon the shoulders of several excellent open-source projects:
 
@@ -260,24 +260,3 @@ This project builds upon the shoulders of several excellent open-source projects
 
 
 We also thank [Lambda](https://lambda.ai/) for providing GPU resources!
-
-## 🔧 Troubleshooting
-
-### Data Download Issues
-
-If `git clone` fails with git-lfs errors, use the Python download script provided above instead. This bypasses git-lfs by using the HuggingFace Hub API.
-
-### Environment Compatibility
-
-If you have an existing environment with PyTorch, vLLM, and Ray (e.g., from GraphCRL), you can reuse it:
-
-```bash
-conda activate verl  # or your existing environment name
-cd /path/to/GraphDancer
-pip install -r requirements.txt
-pip install -e .
-```
-
-### Graph Configuration
-
-The training scripts use the biomedical graph for all domains by default. This is intentional and follows the same configuration as the original implementation. The graph parameter does not need to match the training data domains.

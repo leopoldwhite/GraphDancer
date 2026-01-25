@@ -486,7 +486,7 @@ class RayPPOTrainer:
             train_dataset = create_rl_dataset(
                 self.config.data.train_files, self.config.data, self.tokenizer, self.processor
             )
-        if val_dataset is None:
+        if val_dataset is None and self.config.data.val_files is not None:
             val_dataset = create_rl_dataset(
                 self.config.data.val_files, self.config.data, self.tokenizer, self.processor
             )
@@ -525,26 +525,33 @@ class RayPPOTrainer:
             sampler=train_sampler,
         )
 
-        val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
-        if val_batch_size is None:
-            val_batch_size = len(self.val_dataset)
+        if self.val_dataset is not None:
+            val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
+            if val_batch_size is None:
+                val_batch_size = len(self.val_dataset)
 
-        self.val_dataloader = StatefulDataLoader(
-            dataset=self.val_dataset,
-            batch_size=val_batch_size,
-            num_workers=num_workers,
-            shuffle=self.config.data.get("validation_shuffle", True),
-            drop_last=False,
-            collate_fn=collate_fn,
-        )
+            self.val_dataloader = StatefulDataLoader(
+                dataset=self.val_dataset,
+                batch_size=val_batch_size,
+                num_workers=num_workers,
+                shuffle=self.config.data.get("validation_shuffle", True),
+                drop_last=False,
+                collate_fn=collate_fn,
+            )
+        else:
+            self.val_dataloader = None
 
         assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
-        assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
+        if self.val_dataloader is not None:
+            assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
 
-        print(
-            f"Size of train dataloader: {len(self.train_dataloader)}, Size of val dataloader: "
-            f"{len(self.val_dataloader)}"
-        )
+        if self.val_dataloader is not None:
+            print(
+                f"Size of train dataloader: {len(self.train_dataloader)}, Size of val dataloader: "
+                f"{len(self.val_dataloader)}"
+            )
+        else:
+            print(f"Size of train dataloader: {len(self.train_dataloader)}, No validation dataloader")
 
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
 
