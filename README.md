@@ -43,6 +43,8 @@ This repository contains the official implementation of the paper: *GraphDancer:
 
 Create a virtual environment and install dependencies. We recommend using Python 3.10+.
 
+**Note:** You can use an existing environment if you already have one with PyTorch, vLLM, and Ray installed (e.g., the `verl` environment from GraphCRL).
+
 ```bash
 conda create -n graphdancer python=3.10 -y
 conda activate graphdancer
@@ -79,16 +81,37 @@ cd ../..
 
 #### Training Data (Required)
 
-Download the pre-processed training data:
+Download the pre-processed training and test data:
 
 ```bash
-# Download from Hugging Face
-git clone https://huggingface.co/datasets/yuyangbai/GraphDancer-data
+# Install huggingface_hub if not already installed
+pip install huggingface_hub
 
-# Move to correct location
-mv GraphDancer-data/train data/train
-mv GraphDancer-data/val data/val
+# Download data using Python
+python3 << 'EOF'
+from huggingface_hub import hf_hub_download
+import os
+import shutil
+
+repo_id = "yuyangbai/GraphDancer-data"
+
+# Create directories
+os.makedirs("data/train", exist_ok=True)
+for domain in ["biomedical", "goodreads", "amazon", "legal"]:
+    os.makedirs(f"data/test/{domain}", exist_ok=True)
+
+# Download train file
+train_file = hf_hub_download(repo_id=repo_id, filename="train/train.parquet", repo_type="dataset")
+shutil.copy2(train_file, "data/train/train.parquet")
+
+# Download test files
+for domain in ["biomedical", "goodreads", "amazon", "legal"]:
+    test_file = hf_hub_download(repo_id=repo_id, filename=f"test/{domain}/test.parquet", repo_type="dataset")
+    shutil.copy2(test_file, f"data/test/{domain}/test.parquet")
+EOF
 ```
+
+**Alternative:** If you have existing data at another location, you can create symlinks instead of downloading.
 
 ### 2. Expected Directory Structure
 
@@ -117,12 +140,17 @@ data/
 ├── train/                      # Training data (Academic domains)
 │   └── train.parquet          # 800 samples
 │       # Domains: dblp (150), maple_* (650 total)
-│       # Difficulty: easy (370), medium (120), hard (310)
+│       # Difficulty: easy (320), medium (230), hard (250)
 │
-└── val/                        # Validation data (Biomedical domain)
-    └── test.parquet           # 270 samples
-        # Domain: biomedical (270)
-        # Difficulty: easy (100), medium (150), hard (20)
+└── test/                       # Test data (multiple domains)
+    ├── biomedical/
+    │   └── test.parquet       # 270 samples - Healthcare
+    ├── goodreads/
+    │   └── test.parquet       # 240 samples - Literature
+    ├── amazon/
+    │   └── test.parquet       # 200 samples - E-commerce
+    └── legal/
+        └── test.parquet       # 180 samples - Legal
 ```
 
 ### 3. Training Data Format
@@ -158,7 +186,6 @@ Trains the model using the easy-to-hard curriculum scheduler described in the pa
 # Optional: customize paths (defaults work if you followed data setup)
 export GRAPH_DIR=./data/graphs
 export DATA_DIR=./data/train
-export VAL_DIR=./data/val
 export OUTPUT_DIR=./checkpoints/graphdancer_curriculum
 
 # Optional: specify GPU devices
@@ -185,7 +212,6 @@ Key parameters can be overridden via environment variables:
 |----------|---------|-------------|
 | `GRAPH_DIR` | `./data/graphs` | Path to graph JSON files |
 | `DATA_DIR` | `./data/train` | Path to training parquet files |
-| `VAL_DIR` | `./data/val` | Path to validation parquet files |
 | `BASE_MODEL` | `Qwen/Qwen2.5-3B-Instruct` | Base model for training |
 | `GPUS_PER_NODE` | `4` | Number of GPUs to use |
 | `OUTPUT_DIR` | `./checkpoints` | Checkpoint save directory |
@@ -196,10 +222,19 @@ To evaluate a trained model on a specific domain (e.g., Biomedical):
 
 ```bash
 export GRAPH_DIR=./data/graphs
-export DATA_DIR=./data/val
+export DOMAIN=biomedical  # or: goodreads, amazon, legal
 export CHECKPOINT=./checkpoints/graphdancer_curriculum/actor/global_step_100
+export BASE_MODEL=$CHECKPOINT
 
 bash scripts/launchers/eval_graphdancer.sh
+```
+
+To evaluate on all test domains:
+
+```bash
+for domain in biomedical goodreads amazon legal; do
+    DOMAIN=$domain bash scripts/launchers/eval_graphdancer.sh
+done
 ```
 
 ### Scoring
@@ -225,3 +260,24 @@ This project builds upon the shoulders of several excellent open-source projects
 
 
 We also thank [Lambda](https://lambda.ai/) for providing GPU resources!
+
+## 🔧 Troubleshooting
+
+### Data Download Issues
+
+If `git clone` fails with git-lfs errors, use the Python download script provided above instead. This bypasses git-lfs by using the HuggingFace Hub API.
+
+### Environment Compatibility
+
+If you have an existing environment with PyTorch, vLLM, and Ray (e.g., from GraphCRL), you can reuse it:
+
+```bash
+conda activate verl  # or your existing environment name
+cd /path/to/GraphDancer
+pip install -r requirements.txt
+pip install -e .
+```
+
+### Graph Configuration
+
+The training scripts use the biomedical graph for all domains by default. This is intentional and follows the same configuration as the original implementation. The graph parameter does not need to match the training data domains.

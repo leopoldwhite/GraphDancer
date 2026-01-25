@@ -42,14 +42,15 @@ MAX_RESPONSE_TOKENS=${MAX_RESPONSE_TOKENS:-500}
 MAX_NUM_BATCHED_TOKENS=$(( MAX_PROMPT_TOKENS + MAX_RESPONSE_TOKENS ))
 
 # Domain to evaluate (used for both dataset path and graph selection)
+# Supported domains: biomedical, goodreads, amazon, legal
 DOMAIN=${DOMAIN:-biomedical}
 
-# Dataset directory (must contain train.parquet/test.parquet)
-export DATA_DIR=${DATA_DIR:-data/grbench_fewshot_merged_${DOMAIN}}
+# Dataset directory (must contain test.parquet)
+export DATA_DIR=${DATA_DIR:-data/test/${DOMAIN}}
 
   PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo_format \
     --config-name evaluation_ppo_format \
-    data.train_files=$DATA_DIR/train.parquet \
+    data.train_files=null \
     data.val_files=$DATA_DIR/test.parquet \
     data.train_data_num=null \
     data.val_data_num=null \

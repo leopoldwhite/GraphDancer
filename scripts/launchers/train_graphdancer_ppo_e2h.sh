@@ -5,7 +5,7 @@ set -euo pipefail
 #   export HF_TOKEN=...   # optional
 # Environment (override as needed)
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-4,5,6,7}
-export DATA_DIR=${DATA_DIR:-data/academicTrain_biomedicalValid}
+export DATA_DIR=${DATA_DIR:-data/train}
 export GRAPH_DIR=${GRAPH_DIR:-./data/graphs}
 export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}
 export WAND_PROJECT=${WAND_PROJECT:-GraphDancer}
@@ -32,7 +32,7 @@ MAX_NUM_BATCHED_TOKENS=$(( MAX_PROMPT_TOKENS + MAX_RESPONSE_TOKENS ))
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo_format \
     --config-name ppo_trainer_format \
     data.train_files=$DATA_DIR/train.parquet \
-    data.val_files=$DATA_DIR/test.parquet \
+    data.val_files=null \
     data.train_data_num=null \
     data.val_data_num=null \
     data.train_batch_size=128 \
@@ -83,7 +83,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo_format \
     trainer.logger=['console'] \
     trainer.val_only=false \
     trainer.eval_only=false \
-    trainer.val_before_train=true \
+    trainer.val_before_train=false \
     trainer.default_hdfs_dir=null \
     trainer.n_gpus_per_node=$GPUS_PER_NODE \
     trainer.nnodes=$NNODES \
