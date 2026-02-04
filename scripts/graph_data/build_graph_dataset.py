@@ -12,7 +12,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from agents.graph_constants import GRAPH_DEFINITION, GraphAgent_INSTRUCTION
+from graph_constants import GRAPH_DEFINITION, GraphAgent_INSTRUCTION
 from graph_fewshots import EXAMPLES
 
 def process_dataset(dataset_names, base_dir, examples_dict, split, level_key='new_level'):
