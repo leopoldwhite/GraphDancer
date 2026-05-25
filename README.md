@@ -165,7 +165,8 @@ Run the verl rollout entry point in eval-only mode against the Academic training
 python scripts/dpo/build_preference_pairs.py \
     --jsonl_glob "./data/dpo/k8_rollouts/*/results.jsonl" \
     --train_parquet ./data/train/train.parquet \
-    --out ./data/dpo/pair_parquet/pairs.parquet
+    --out_parquet ./data/dpo/pair_parquet/pairs.parquet \
+    --lex_version v1
 ```
 
 The script ranks the M=8 trajectories per question by `(EM, EH, VF, -loop_limit, -invalid_tool, -n_graph_rounds)` with fixed tie-break priority and emits one extreme pair per qid (rank-1 vs rank-M), along with character-level `<information>` spans needed for the agent-token mask.
