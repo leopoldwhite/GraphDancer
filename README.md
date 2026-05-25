@@ -3,7 +3,7 @@
 </p>
 
 <h3 align="center">
-GraphDancer: Training LLMs to Explore and Reason over Graphs via Curriculum Reinforcement Learning
+GraphDancer: Training LLMs to Explore and Reason over Graphs via Two-Stage Curriculum Post-Training
 </h3>
 
 <!--- BADGES: START --->
@@ -14,36 +14,47 @@ GraphDancer: Training LLMs to Explore and Reason over Graphs via Curriculum Rein
 </p>
 <!--- BADGES: END --->
 
-**GraphDancer** is a reinforcement learning framework that trains Large Language Models (LLMs) to adaptively interleave natural-language reasoning with graph function execution. By leveraging a **graph-aware curriculum**, GraphDancer enables moderate-sized models (e.g., 3B parameters) to internalize multi-hop reasoning skills and robustly generalize to unseen domains and heterogeneous graph structures.
+**GraphDancer** is a two-stage post-training framework that teaches Large Language Models (LLMs) to interleave natural-language reasoning with graph function execution. The first stage (**Curriculum-PPO**) uses proximal policy optimization with executable rule-based rewards to teach the model how to interact with the graph. The second stage (**Curriculum-DPO**) refines the PPO policy on self-generated preference pairs to make interactions more grounded and efficient. Both stages are organized by a **graph-aware curriculum** that progressively increases task difficulty based on the structural complexity of information-seeking trajectories (S-rounds and E-rounds). With a 3B backbone, GraphDancer outperforms graph-agent baselines built on substantially larger or stronger models.
 
-This repository contains the official implementation of the paper: *GraphDancer: Training LLMs to Explore and Reason over Graphs via Curriculum Reinforcement Learning*.
+This repository contains the official implementation of the paper: *GraphDancer: Training LLMs to Explore and Reason over Graphs via Two-Stage Curriculum Post-Training*.
 
 ## 🌟 Key Features
 
-* **Interleaved Reasoning & Action**: Trains agents to alternate between `<think>` (reasoning) and `<graph>` (function execution) blocks.
-* **Graph-Aware Curriculum**: A novel training scheduler that transitions from simple lookup tasks (S-rounds) to complex neighborhood expansions (E-rounds).
-* **Rule-Based Reward Shaping**: Proximal Policy Optimization (PPO) integration with format-aware and correctness-based rewards.
-* **Cross-Domain Generalization**: Proven effectiveness on the GRBench multi-domain benchmark (Academic, Biomedical, Legal, etc.).
+* **Two-Stage Post-Training**: Curriculum-PPO (online, rule-based reward over executable graph calls) followed by Curriculum-DPO (offline preference learning over self-sampled trajectories ranked by six trajectory-level keys with fixed tie-break priority).
+* **Interleaved Reasoning & Action**: Trains agents to alternate between `<think>` (reasoning), `<graph>` (function execution), `<information>` (environment feedback), and `<answer>` blocks.
+* **Graph-Aware Curriculum**: A graph-specific scheduler that decomposes trajectories into Singleton lookup rounds (S-rounds) and Neighborhood expansion rounds (E-rounds), and biases batch composition from Easy to Hard via a time-varying mixture.
+* **Rule-Based Reward Shaping**: Format-aware and correctness-based rewards with no learned reward model.
+* **Cross-Domain Generalization**: Train on the Academic domain and evaluate on four unseen GRBench domains (E-commerce, Literature, Healthcare, Legal) plus out-of-distribution question types.
 
 ## 📂 Repository Structure
 
 ```text
-├── graphdancer/        # Core logic for multi-turn generation and tool management
-├── verl/               # RL training runtime (PPO implementation)
+├── graphdancer/            # Core logic for multi-turn generation and tool management
+│   └── llm_agent/
+│       ├── generation*.py  # Rollout drivers for the interleaved think/graph/information loop
+│       ├── tensor_helper.py
+│       └── tools/          # Graph function executor and retriever
+├── verl/
+│   ├── trainer/
+│   │   ├── ppo/            # Stage 1: Curriculum-PPO (online RL)
+│   │   └── dpo/            # Stage 2: Curriculum-DPO (offline preference learning)
+│   ├── experimental/
+│   │   └── dataset/        # E2H biased-mixture curriculum sampler (crl_e2h.py)
+│   └── ...                 # upstream verl utilities
 ├── scripts/
-│   ├── launchers/      # Entry points for training and evaluation
-│   ├── graph_data/     # Utilities for converting raw graph data to parquet
-│   └── build_*.sh      # Dataset construction scripts
-├── data/               # Placeholder for processed datasets and graph files
-└── eval.py             # Evaluation script for computing EM, BLEU, and ROUGE
-
+│   ├── launchers/          # Entry points for Stage 1 / Stage 2 training and evaluation
+│   ├── curriculum/         # Curriculum prompt templates (graph-aware and Graph-CoT)
+│   ├── dpo/                # Stage 2 preference-pair construction + analysis
+│   ├── graph_data/         # Utilities for converting raw graph data to parquet
+│   └── build_*.sh          # Dataset construction scripts
+├── data/                   # Placeholder for processed datasets and graph files
+├── eval.py                 # Evaluation script (Exact Match, BLEU, ROUGE, GPT4-Score)
+└── LICENSE                 # CC BY 4.0
 ```
 
 ## 🛠️ Installation
 
-Create a virtual environment and install dependencies. We recommend using Python 3.10+.
-
-**Note:** You can use an existing environment if you already have one with PyTorch, vLLM, and Ray installed (e.g., the `verl` environment from GraphCRL).
+Create a virtual environment and install dependencies. We recommend Python 3.10+.
 
 ```bash
 conda create -n graphdancer python=3.10 -y
@@ -55,191 +66,136 @@ pip install torch torchvision torchaudio
 # Install repository dependencies and the package in editable mode
 pip install -r requirements.txt
 pip install -e .
-
 ```
 
 ## 📊 Data Preparation
 
-GraphDancer utilizes the graph environments and QA data formats from **GRBench**. We provide pre-processed datasets for quick start.
+GraphDancer uses the graph environments and QA formats from **GRBench** (Jin et al., 2024). We provide pre-processed datasets on Hugging Face for a quick start.
 
-### 1. Download Data
-
-#### Graph Data (Required)
-
-Download the GRBench graph data from Hugging Face:
+### 1. Download Graph Data
 
 ```bash
 cd data
 git lfs install
 git clone https://huggingface.co/datasets/yuyangbai/GRBench-copy graphs
 
-# For legal graph, concatenate the chunks
+# For the legal graph, concatenate the chunks
 cd graphs/legal
 cat chunk_* > graph.json
 cd ../..
 ```
 
-#### Training Data (Required)
-
-Download the pre-processed training and test data:
+### 2. Download Training and Test Data
 
 ```bash
-# Install huggingface_hub if not already installed
 pip install huggingface_hub
 
-# Download data using Python
 python3 << 'EOF'
 from huggingface_hub import hf_hub_download
-import os
-import shutil
+import os, shutil
 
 repo_id = "yuyangbai/GraphDancer-data"
 
-# Create directories
 os.makedirs("data/train", exist_ok=True)
 for domain in ["biomedical", "goodreads", "amazon", "legal"]:
     os.makedirs(f"data/test/{domain}", exist_ok=True)
 
-# Download train file
 train_file = hf_hub_download(repo_id=repo_id, filename="train/train.parquet", repo_type="dataset")
 shutil.copy2(train_file, "data/train/train.parquet")
 
-# Download test files
 for domain in ["biomedical", "goodreads", "amazon", "legal"]:
     test_file = hf_hub_download(repo_id=repo_id, filename=f"test/{domain}/test.parquet", repo_type="dataset")
     shutil.copy2(test_file, f"data/test/{domain}/test.parquet")
 EOF
 ```
 
-**Alternative:** If you have existing data at another location, you can create symlinks instead of downloading.
-
-### 2. Expected Directory Structure
-
-After setup, your `data/` directory should look like this:
+### 3. Expected Directory Structure
 
 ```text
 data/
-├── graphs/                     # Graph data from GRBench
-│   ├── dblp/
-│   │   └── graph.json         # 15GB - Academic (Computer Science)
-│   ├── maple/
-│   │   ├── Biology/graph.json       # 6.2GB
-│   │   ├── Chemistry/graph.json     # 5.3GB
-│   │   ├── Materials_Science/graph.json  # 3.8GB
-│   │   ├── Medicine/graph.json      # 6.7GB
-│   │   └── Physics/graph.json       # 4.5GB
-│   ├── biomedical/
-│   │   └── graph.json         # 154MB - Healthcare
-│   ├── legal/
-│   │   └── graph.json         # 84GB (chunked on HF)
-│   ├── amazon/
-│   │   └── graph.json         # 20GB - E-commerce
-│   └── goodreads/
-│       └── graph.json         # 9.1GB - Literature
-│
-├── train/                      # Training data (Academic domains)
-│   └── train.parquet          # 800 samples
-│       # Domains: dblp (150), maple_* (650 total)
-│       # Difficulty: easy (320), medium (230), hard (250)
-│
-└── test/                       # Test data (multiple domains)
-    ├── biomedical/
-    │   └── test.parquet       # 270 samples - Healthcare
-    ├── goodreads/
-    │   └── test.parquet       # 240 samples - Literature
-    ├── amazon/
-    │   └── test.parquet       # 200 samples - E-commerce
-    └── legal/
-        └── test.parquet       # 180 samples - Legal
+├── graphs/                      # Graph data from GRBench
+│   ├── dblp/graph.json          # Academic
+│   ├── biomedical/graph.json    # Healthcare
+│   ├── legal/graph.json         # Legal (chunked on HF)
+│   ├── amazon/graph.json        # E-commerce
+│   └── goodreads/graph.json     # Literature
+├── train/train.parquet          # Academic training set
+└── test/<domain>/test.parquet   # Per-domain test sets
 ```
 
-### 3. Training Data Format
+## 🚀 Training — Stage 1 (Curriculum-PPO)
 
-Each sample in the parquet files contains:
+Stage 1 trains the policy with executable rule-based rewards on the Academic domain.
 
-| Field | Description |
-|-------|-------------|
-| `prompt` | Formatted instruction with graph definition and few-shot examples |
-| `reward_model.ground_truth` | Expected answer for reward computation |
-| `extra_info.domain` | Domain identifier (e.g., `dblp`, `maple_Biology`, `biomedical`) |
-| `extra_info.difficulty` | Difficulty level: `easy`, `medium`, or `hard` |
+### Curriculum-PPO (Proposed Stage 1)
 
-### 4. Build from Raw Data (Optional)
-
-If you prefer to build training data from scratch:
+Trains with the biased-mixture curriculum scheduler described in §2.4 of the paper.
 
 ```bash
-# Organize raw Graph-CoT data into data/processed_data/
-# Then run:
-bash scripts/build_academic_biomedical.sh
-```
-
-## 🚀 Training
-
-We support both standard PPO and our proposed Graph-Aware Curriculum Learning. Configuration is handled via environment variables.
-
-### Graph-Aware Curriculum RL (Proposed Method)
-
-Trains the model using the easy-to-hard curriculum scheduler described in the paper.
-
-```bash
-# Optional: customize paths (defaults work if you followed data setup)
 export GRAPH_DIR=./data/graphs
 export DATA_DIR=./data/train
-export OUTPUT_DIR=./checkpoints/graphdancer_curriculum
+export OUTPUT_DIR=./checkpoints/graphdancer_curriculum_ppo
 
-# Optional: specify GPU devices
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-
-# Launches training with the curriculum mixture sampler
 bash scripts/launchers/train_graphdancer_ppo_e2h_mix.sh
+```
+
+### Pure Easy-to-Hard (Ablation)
+
+```bash
+bash scripts/launchers/train_graphdancer_ppo_e2h.sh
 ```
 
 ### Vanilla PPO Baseline
 
-Trains the model using vanilla PPO without curriculum scheduling.
-
 ```bash
-export OUTPUT_DIR=./checkpoints/baseline_ppo
 bash scripts/launchers/train_graphdancer_ppo.sh
 ```
 
-### Training Configuration
+## 🚀 Training — Stage 2 (Curriculum-DPO)
 
-Key parameters can be overridden via environment variables:
+Stage 2 refines the Stage 1 checkpoint via DPO on self-generated preference pairs ranked by the six trajectory-level keys defined in §2.3 of the paper with fixed tie-break priority. The full procedure is described in §2.3, Algorithm 1 Phase 2, and Appendix A.2 of the paper.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GRAPH_DIR` | `./data/graphs` | Path to graph JSON files |
-| `DATA_DIR` | `./data/train` | Path to training parquet files |
-| `BASE_MODEL` | `Qwen/Qwen2.5-3B-Instruct` | Base model for training |
-| `GPUS_PER_NODE` | `4` | Number of GPUs to use |
-| `OUTPUT_DIR` | `./checkpoints` | Checkpoint save directory |
+### 1. Sample M=8 trajectories from the PPO checkpoint
+
+Run the verl rollout entry point in eval-only mode against the Academic training set with `val_kwargs.n=8`, dumping per-trajectory traces to `results.jsonl`. Default decoding: temperature 1.0, top-p 0.95, max_turns 10.
+
+### 2. Build the preference-pair parquet
+
+```bash
+python scripts/dpo/build_preference_pairs.py \
+    --jsonl_glob "./data/dpo/k8_rollouts/*/results.jsonl" \
+    --train_parquet ./data/train/train.parquet \
+    --out ./data/dpo/pair_parquet/pairs.parquet
+```
+
+The script ranks the M=8 trajectories per question by `(EM, EH, VF, -loop_limit, -invalid_tool, -n_graph_rounds)` with fixed tie-break priority and emits one extreme pair per qid (rank-1 vs rank-M), along with character-level `<information>` spans needed for the agent-token mask.
+
+### 3. Run DPO training
+
+```bash
+export PAIR_PARQUET=./data/dpo/pair_parquet/pairs.parquet
+export PPO_CHECKPOINT=./checkpoints/graphdancer_curriculum_ppo/actor/global_step_200
+export OUTPUT_DIR=./checkpoints/graphdancer_curriculum_dpo
+
+bash scripts/launchers/train_graphdancer_dpo.sh
+```
+
+The launcher trains for 100 steps with β=0.1, learning rate 2e-7, linear warmup over 5% of steps, and the same E2H biased-mixture curriculum used in Stage 1.
 
 ## 📝 Evaluation
 
-To evaluate a trained model on a specific domain (e.g., Biomedical):
+Evaluate a trained checkpoint on a specific domain (e.g., Healthcare):
 
 ```bash
 export GRAPH_DIR=./data/graphs
-export DOMAIN=biomedical  # or: goodreads, amazon, legal
-export CHECKPOINT=./checkpoints/graphdancer_curriculum/actor/global_step_100
+export DOMAIN=biomedical
+export CHECKPOINT=./checkpoints/graphdancer_curriculum_dpo/actor/global_step_100
 export BASE_MODEL=$CHECKPOINT
 
 bash scripts/launchers/eval_graphdancer.sh
 ```
 
-To evaluate on all test domains:
-
-```bash
-for domain in biomedical goodreads amazon legal; do
-    DOMAIN=$domain bash scripts/launchers/eval_graphdancer.sh
-done
-```
-
 ### Scoring
-
-Generate metrics (Exact Match, BLEU, ROUGE) from the inference results:
 
 ```bash
 # Basic metrics
@@ -251,15 +207,20 @@ python eval.py --result_file results/biomedical/results.jsonl --use_gpt4_score
 
 ## Acknowledgements
 
-This project builds upon the shoulders of several excellent open-source projects:
+This project builds upon several excellent open-source projects:
 
-- [Graph-CoT](https://github.com/PeterGriffinJin/Graph-CoT) for their graph function implementation and the GRBench benchmark.
+- [Graph-CoT](https://github.com/PeterGriffinJin/Graph-CoT) for the graph function implementation and the GRBench benchmark.
 - [Search-R1](https://github.com/PeterGriffinJin/Search-R1) for inspiring our agentic RL training framework design.
-- [veRL](https://github.com/volcengine/verl) for providing a robust and scalable RL training framework.
+- [veRL](https://github.com/volcengine/verl) for a robust and scalable RL training framework.
 - [vLLM](https://github.com/vllm-project/vllm) for efficient and high-throughput LLM inference.
 
+We also thank [Lambda](https://lambda.ai/) for providing GPU resources.
 
-We also thank [Lambda](https://lambda.ai/) for providing GPU resources!
+## 📄 License
+
+This repository is released under the Creative Commons Attribution 4.0 International (CC BY 4.0) license. See [`LICENSE`](LICENSE) for the full text.
+
+The `verl/` subdirectory contains upstream code from the [verl](https://github.com/volcengine/verl) project and is licensed under Apache 2.0; the original copyright and license headers are retained.
 
 ## Citation
 
@@ -267,12 +228,12 @@ If you find our work useful, please consider citing:
 
 ```bibtex
 @misc{bai2026graphdancertrainingllmsexplore,
-      title={GraphDancer: Training LLMs to Explore and Reason over Graphs via Curriculum Reinforcement Learning}, 
-      author={Yuyang Bai and Zhuofeng Li and Ping Nie and Jianwen Xie and Yu Zhang},
+      title={GraphDancer: Training LLMs to Explore and Reason over Graphs via Two-Stage Curriculum Post-Training},
+      author={Yuyang Bai and Zhuofeng Li and Ping Nie and Yu Wang and Jianwen Xie and Yu Zhang},
       year={2026},
       eprint={2602.02518},
       archivePrefix={arXiv},
       primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2602.02518}, 
+      url={https://arxiv.org/abs/2602.02518},
 }
 ```

@@ -12,7 +12,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from graph_constants import GRAPH_DEFINITION, GraphAgent_INSTRUCTION
+from agents.graph_constants import GRAPH_DEFINITION, GraphAgent_INSTRUCTION
 from graph_fewshots import EXAMPLES
 
 def process_dataset(dataset_names, base_dir, examples_dict, split, level_key='new_level'):
@@ -41,15 +41,11 @@ def process_dataset(dataset_names, base_dir, examples_dict, split, level_key='ne
             print(f"Processing {path}")
             rel_path = os.path.relpath(path, base_dir)
             graph_name = os.path.dirname(rel_path) # e.g. maple/Physics
-
-            # Convert graph_name to domain format (maple/Biology -> maple_Biology)
-            # This matches the keys in graph.domains config
-            domain = graph_name.replace('/', '_')
-
-            # graph_key (maple, dblp, etc.) for looking up examples and definitions
+            
+            # graph_key (maple, dblp, etc.)
             parts = graph_name.split('/')
             graph_key = parts[0]
-
+            
             ex_text = examples_dict.get(graph_key, "")
             def_text = GRAPH_DEFINITION.get(graph_key, "")
             
@@ -83,12 +79,11 @@ def process_dataset(dataset_names, base_dir, examples_dict, split, level_key='ne
                             'reward_model': {'ground_truth': str(answer), 'style': 'rule'},
                             'extra_info': {
                                 'answer': str(answer),
-                                'domain': domain,  # e.g. maple_Biology, dblp, biomedical
-                                'graph_name': graph_name,  # kept for backward compat
+                                'graph_name': graph_name,
                                 'index': index,
                                 'split': split,
                                 'question': question,
-                                'difficulty': level_val  # renamed from new_level for clarity
+                                'new_level': level_val
                             }
                         }
                         data_list.append(entry)

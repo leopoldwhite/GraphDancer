@@ -5,7 +5,7 @@ import sys
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 sys.path.insert(0, PROJECT_ROOT)
 
-from graph_constants import GRAPH_DEFINITION
+from agents.graph_constants import GRAPH_DEFINITION
 
 def get_examples():
     examples = {}
