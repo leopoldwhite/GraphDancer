@@ -18,7 +18,7 @@ of graph functions, interleaving reasoning with information seeking, using singl
 PPO with a **graph-aware curriculum**. This repository contains the training and
 evaluation code, the fixed data partition, and launchers for every training run
 reported in the paper (GraphDancer on Qwen2.5-3B-Instruct and Qwen3-14B, Vanilla PPO,
-and the Static / Reverse / Fast schedule controls).
+and the Static Mixture / Hard-to-Easy / Fast Pacing schedule controls).
 
 ## Contents
 
@@ -67,9 +67,9 @@ p_t(k) = (1 − η_t)·g_t(k) + η_t·q(k),  η_t = 0.2 + 0.6·u_t,   q = (0.34,
 Per update, level counts are drawn from `Multinomial(128, p_t)` and questions are
 taken from per-level shuffled queues that are reshuffled when exhausted
 (`verl/experimental/dataset/crl_e2h.py`, class `E2HGaussianSampler`). The schedule
-controls replace `p_t`: **Static** uses the mean of the GraphDancer schedule over the
-200 updates (fixed proportions), **Reverse** runs it from hard to easy (`t → T−1−t`),
-and **Fast** completes it in the first 100 updates and then keeps its final mixture.
+controls replace `p_t`: **Static Mixture** (`static`) uses the mean of the GraphDancer schedule over the
+200 updates (fixed proportions), **Hard-to-Easy** (`reverse`) runs it from hard to easy (`t → T−1−t`),
+and **Fast Pacing** (`fast`) completes it in the first 100 updates and then keeps its final mixture.
 **Vanilla PPO** samples questions uniformly.
 
 ## Repository layout
@@ -78,7 +78,7 @@ and **Fast** completes it in the first 100 updates and then keeps its final mixt
 |---|---|
 | `graphdancer/llm_agent/` | multi-turn rollout loop (`generation_graph.py`), graph functions and node retriever (`tools/`) |
 | `verl/` | fork of [verl](https://github.com/volcengine/verl) 0.5.0.dev with the GraphDancer extensions (GraphDancer uses its PPO/GAE path); entry point `verl/trainer/main_ppo_format.py` |
-| `verl/experimental/dataset/crl_e2h.py` | curriculum sampler (GraphDancer schedule and the Static / Reverse / Fast controls) |
+| `verl/experimental/dataset/crl_e2h.py` | curriculum sampler (GraphDancer schedule and the Static Mixture / Hard-to-Easy / Fast Pacing controls) |
 | `verl/trainer/config/ppo_trainer_format.yaml`, `evaluation_ppo_format.yaml` | training / evaluation configs |
 | `verl/utils/reward_score/qa_em_format.py` | rule-based reward |
 | `data/split701020_v1/` | the fixed 70:10:20 partition (question IDs, frozen levels, prompt templates, hashes) |
@@ -186,9 +186,9 @@ RAM); evaluation loads one graph per run.
 ```bash
 bash scripts/runs/graphdancer_qwen2.5_3b.sh      # GraphDancer, Qwen2.5-3B-Instruct, 1 node x 4 GPUs
 bash scripts/runs/vanilla_ppo_qwen2.5_3b.sh      # Vanilla PPO (uniform sampling)
-bash scripts/runs/static_qwen2.5_3b.sh           # Static schedule control
-bash scripts/runs/reverse_qwen2.5_3b.sh          # Reverse schedule control
-bash scripts/runs/fast_qwen2.5_3b.sh             # Fast schedule control
+bash scripts/runs/static_qwen2.5_3b.sh           # Static Mixture schedule control
+bash scripts/runs/reverse_qwen2.5_3b.sh          # Hard-to-Easy schedule control
+bash scripts/runs/fast_qwen2.5_3b.sh             # Fast Pacing schedule control
 bash scripts/runs/pure_e2h_qwen2.5_3b.sh         # optional: pure easy-to-hard (eta = 0); not a run reported in the paper
 bash scripts/runs/graphdancer_qwen3_14b.sh       # GraphDancer, Qwen3-14B, 2 nodes x 8 GPUs (see below)
 ```
@@ -330,7 +330,7 @@ python scripts/select_checkpoint.py --experiment graphdancer-qwen2.5-3b --steps 
 3. **Select** each run's checkpoint on the validation partition
    (`select_checkpoint.py`, decode seeds 1 and 2). The selected updates in our runs were
    200 (GraphDancer, Qwen2.5-3B), 175 (GraphDancer, Qwen3-14B), 175 (Vanilla PPO),
-   200 (Static), 150 (Reverse) and 150 (Fast).
+   200 (Static Mixture), 150 (Hard-to-Easy) and 150 (Fast Pacing).
 4. **Evaluate** the selected checkpoint on the 834 test questions (`SETS="test ood"`)
    and score with `score_rouge.py` and `gptscore.py`. Each GraphDancer and control row
    in the paper is one complete evaluation run with a single decode seed (set via `SEEDS`).
