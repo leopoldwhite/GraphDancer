@@ -30,7 +30,6 @@ from omegaconf import DictConfig
 
 import verl.utils.torch_functional as verl_F
 from verl.trainer.config import AlgoConfig
-from verl.utils import as_torch_index, group_mean_std
 from verl.utils.import_utils import deprecated
 from verl.workers.config import ActorConfig
 
@@ -95,16 +94,13 @@ class AdvantageEstimator(str, Enum):
     """
 
     GAE = "gae"
-    GRPO = "grpo"
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
     REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
     REMAX = "remax"
     RLOO = "rloo"
     OPO = "opo"
-    GRPO_PASSK = "grpo_passk"
     GPG = "gpg"
     RLOO_VECTORIZED = "rloo_vectorized"
-    GRPO_VECTORIZED = "grpo_vectorized"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -258,163 +254,6 @@ def compute_gae_advantage_return(
         returns = advantages + values
         advantages = verl_F.masked_whiten(advantages, response_mask)
     return advantages, returns
-
-
-# NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
-@register_adv_est(AdvantageEstimator.GRPO)  # or simply: @register_adv_est("grpo")
-def compute_grpo_outcome_advantage(
-    token_level_rewards: torch.Tensor,
-    response_mask: torch.Tensor,
-    index: np.ndarray,
-    epsilon: float = 1e-6,
-    norm_adv_by_std_in_grpo: bool = True,
-    config: Optional[AlgoConfig] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compute advantage for GRPO, operating only on Outcome reward
-    (with only one scalar reward for each response).
-
-    Args:
-        token_level_rewards: `(torch.Tensor)`
-            shape is (bs, response_length)
-        response_mask: `(torch.Tensor)`
-            shape is (bs, response_length)
-        index: `(np.ndarray)`
-            index array for grouping
-        epsilon: `(float)`
-            small value to avoid division by zero
-        norm_adv_by_std_in_grpo: `(bool)`
-            whether to scale the GRPO advantage
-        config: `(Optional[AlgoConfig])`
-            algorithm configuration object
-
-    Note:
-        If norm_adv_by_std_in_grpo is True, the advantage is scaled by the std, as in the original GRPO.
-        If False, the advantage is not scaled, as in Dr.GRPO (https://arxiv.org/abs/2503.20783).
-
-    Returns:
-        advantages: `(torch.Tensor)`
-            shape is (bs, response_length)
-        Returns: `(torch.Tensor)`
-            shape is (bs, response_length)
-    """
-    scores = token_level_rewards.sum(dim=-1)
-
-    id2score = defaultdict(list)
-    id2mean = {}
-    id2std = {}
-
-    with torch.no_grad():
-        bsz = scores.shape[0]
-        for i in range(bsz):
-            id2score[index[i]].append(scores[i])
-        for idx in id2score:
-            if len(id2score[idx]) == 1:
-                id2mean[idx] = torch.tensor(0.0)
-                id2std[idx] = torch.tensor(1.0)
-            elif len(id2score[idx]) > 1:
-                scores_tensor = torch.stack(id2score[idx])
-                id2mean[idx] = torch.mean(scores_tensor)
-                id2std[idx] = torch.std(scores_tensor)
-            else:
-                raise ValueError(f"no score in prompt index: {idx}")
-        for i in range(bsz):
-            if norm_adv_by_std_in_grpo:
-                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
-            else:
-                scores[i] = scores[i] - id2mean[index[i]]
-        scores = scores.unsqueeze(-1) * response_mask
-
-    return scores, scores
-
-
-@register_adv_est(AdvantageEstimator.GRPO_VECTORIZED)
-def compute_grpo_vectorized_outcome_advantage(
-    token_level_rewards: torch.Tensor,
-    response_mask: torch.Tensor,
-    index: np.ndarray,
-    epsilon: float = 1e-6,
-    norm_adv_by_std_in_grpo: bool = True,
-    config: Optional[AlgoConfig] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Vectorized GRPO（outcome-only）:
-      For each group g:
-      a_i = \\frac{r_i - \\mu_g}{\\sigma_g} (or without dividing by \\sigma_g),
-      then broadcast the scalar across the token dimension (multiplied by response_mask).。
-    """
-    with torch.no_grad():
-        scores = token_level_rewards.sum(dim=-1)
-        g = as_torch_index(index, device=scores.device)
-        mean_g, std_g, _ = group_mean_std(scores, g, eps=epsilon)
-        if norm_adv_by_std_in_grpo:
-            scalars = (scores - mean_g[g]) / (std_g[g] + epsilon)
-        else:
-            scalars = scores - mean_g[g]
-        advantages = scalars.unsqueeze(-1) * response_mask
-        return advantages, advantages
-
-
-@register_adv_est(AdvantageEstimator.GRPO_PASSK)  # or simply: @register_adv_est("grpo_passk")
-def compute_grpo_passk_outcome_advantage(
-    token_level_rewards: torch.Tensor,
-    response_mask: torch.Tensor,
-    index: np.ndarray,
-    epsilon: float = 1e-6,
-    norm_adv_by_std_in_grpo: bool = True,
-    config: Optional[AlgoConfig] = None,
-    **kwargs,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compute advantage for Pass@k using a GRPO-style outcome reward formulation.
-    Only the best response per group gets a non-zero advantage: r_max - r_second_max.
-
-    Implemented as described in https://arxiv.org/abs/2503.19595.
-
-    Args:
-        token_level_rewards: (bs, response_length)
-        response_mask: (bs, response_length)
-        index: (bs,) → group ID per sample
-        epsilon: float for numerical stability
-        config: (AlgoConfig) algorithm settings, which contains "norm_adv_by_std_in_grpo"
-
-    Returns:
-        advantages: (bs, response_length)
-        returns: (bs, response_length)
-    """
-    assert config is not None
-    # if True, normalize advantage by std within group
-    norm_adv_by_std_in_grpo = config.get("norm_adv_by_std_in_grpo", True)
-    scores = token_level_rewards.sum(dim=-1)  # (bs,)
-    advantages = torch.zeros_like(scores)
-
-    id2scores = defaultdict(list)
-    id2indices = defaultdict(list)
-
-    with torch.no_grad():
-        bsz = scores.shape[0]
-        for i in range(bsz):
-            idx = index[i]
-            id2scores[idx].append(scores[i])
-            id2indices[idx].append(i)
-
-        for idx in id2scores:
-            rewards = torch.stack(id2scores[idx])  # (k,)
-            if rewards.numel() < 2:
-                raise ValueError(
-                    f"Pass@k requires at least 2 samples per group. Got {rewards.numel()} for group {idx}."
-                )
-            topk, topk_idx = torch.topk(rewards, 2)
-            r_max, r_second_max = topk[0], topk[1]
-            i_max = id2indices[idx][topk_idx[0].item()]
-            advantage = r_max - r_second_max
-            if norm_adv_by_std_in_grpo:
-                std = torch.std(rewards)
-                advantage = advantage / (std + epsilon)
-            advantages[i_max] = advantage
-
-    advantages = advantages.unsqueeze(-1) * response_mask
-    return advantages, advantages
 
 
 @register_adv_est(
@@ -796,7 +635,7 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)
         loss = torch.sum(seq_losses) / loss_mask.shape[-1]  # The divisor
         # (loss_mask.shape[-1]) should ideally be constant
-        # throughout training to well-replicate the DrGRPO paper.
+        # throughout training.
         # TODO: Perhaps add user-defined normalizer argument to
         # agg_loss to ensure divisor stays constant throughout.
     else:
@@ -1046,8 +885,7 @@ def compute_policy_loss_gpg(
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_log_probs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Adapted from
-    https://github.com/AMAP-ML/GPG/blob/main/VisualThinker-R1-Zero/src/open-r1-multimodal/src/open_r1/trainer/grpo_trainer.py#L495
+    """Adapted from the GPG reference implementation (https://github.com/AMAP-ML/GPG).
     Args:
         log_prob: `(torch.Tensor)`
             shape: (bs, response_length)

@@ -737,6 +737,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
+        # Concurrent eval ranks must not write the same Inductor autotune JSON.
+        if os.environ.get("GD_EVAL_COMPILE_CACHE_ROOT"):
+            os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(
+                os.environ["GD_EVAL_COMPILE_CACHE_ROOT"], str(os.getpid()))
         from verl.workers.actor import DataParallelPPOActor
 
         # This is used to import external_lib into the huggingface systems

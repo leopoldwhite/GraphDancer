@@ -1,0 +1,135 @@
+{
+  "version": "split701020-v1",
+  "description": "Fixed 70:10:20 partition of the GRBench Academic (DBLP + five MAPLE graphs) and Biomedical (GRBench 'healthcare') questions, plus the unseen-domain test sets (E-commerce = amazon, Literature = goodreads, Legal = legal).",
+  "source": "GRBench question files (Hugging Face dataset PeterJinGo/GRBench); records are matched by (graph file, qid).",
+  "partition_rule": "split.jsonl is the definition of the partition; this rule is a summary only and does not regenerate it. Pool of 1,070 Academic/Biomedical questions (GRBench 'hard'/OOD-type Academic questions excluded), divided into roughly 70% train, 10% validation and 20% in-domain test with per-graph quotas and question-template stratification. Derived from an earlier train/test division of the same pool: train is a subset of the earlier train side, in-domain test a subset of the earlier test side, and validation was drawn from both sides (50 and 57 questions), allocated per graph and template by largest remainder with numpy RandomState(20260911). Partitions are disjoint by question identity and share the underlying graphs.",
+  "counts": {
+    "train": 749,
+    "validation": 107,
+    "test": 214,
+    "ood": 620
+  },
+  "counts_by_graph": {
+    "ood/amazon": 200,
+    "ood/goodreads": 240,
+    "ood/legal": 180,
+    "test/biomedical": 54,
+    "test/dblp": 30,
+    "test/maple_Biology": 26,
+    "test/maple_Chemistry": 26,
+    "test/maple_Materials_Science": 26,
+    "test/maple_Medicine": 26,
+    "test/maple_Physics": 26,
+    "train/biomedical": 189,
+    "train/dblp": 105,
+    "train/maple_Biology": 91,
+    "train/maple_Chemistry": 91,
+    "train/maple_Materials_Science": 91,
+    "train/maple_Medicine": 91,
+    "train/maple_Physics": 91,
+    "validation/biomedical": 27,
+    "validation/dblp": 15,
+    "validation/maple_Biology": 13,
+    "validation/maple_Chemistry": 13,
+    "validation/maple_Materials_Science": 13,
+    "validation/maple_Medicine": 13,
+    "validation/maple_Physics": 13
+  },
+  "level_counts": {
+    "test/easy": 66,
+    "test/hard": 71,
+    "test/medium": 77,
+    "train/easy": 234,
+    "train/hard": 242,
+    "train/medium": 273,
+    "validation/easy": 40,
+    "validation/hard": 34,
+    "validation/medium": 33
+  },
+  "fields": {
+    "partition": "train | validation | test (in-domain) | ood (unseen domain)",
+    "domain": "graph name used for routing (biomedical, dblp, maple_<Field>, amazon, goodreads, legal)",
+    "grbench_file": "public GRBench question file",
+    "qid": "GRBench question id within grbench_file",
+    "index": "stable row identifier within the graph (written to extra_info.index and used as the scoring key)",
+    "level": "frozen structural level used by the curriculum (null for unseen-domain questions)",
+    "template_id": "question template id, namespaced by graph family (see question_templates.json)",
+    "qa_sha256": "sha256 of canonical JSON {question, answer} after question normalization"
+  },
+  "question_normalization": "question if it ends with '?' else question.strip() + '?'; answer = str(answer)",
+  "files": {
+    "train/train.parquet": {
+      "n": 749,
+      "canonical_sha256": "c4c3345147441fe19692b45136e6744dc7ee9d146a7b70d0657dcbe95b9ab75e"
+    },
+    "eval/validation/biomedical.parquet": {
+      "n": 27,
+      "canonical_sha256": "6a61755aa401b099696a5329435c1e081ffad4d3d561ec8962132960f6baf4c0"
+    },
+    "eval/validation/dblp.parquet": {
+      "n": 15,
+      "canonical_sha256": "fa74a84423895771c244a6e99289bde216d6bf7be8075e73df93c0b1f51d98de"
+    },
+    "eval/validation/maple_Biology.parquet": {
+      "n": 13,
+      "canonical_sha256": "f89276cbf9bbce9b3da7c1a6f69f7a5973a1e28efd43a9e027c282ba9251a92f"
+    },
+    "eval/validation/maple_Chemistry.parquet": {
+      "n": 13,
+      "canonical_sha256": "a4a209fd17ee977889dd16e1ae54d891cdd8c6d4a11cbaebe3353ddb57db9738"
+    },
+    "eval/validation/maple_Materials_Science.parquet": {
+      "n": 13,
+      "canonical_sha256": "71fc220b5052d57305929dffdf09c6d7fd98060c6cad46a9a4b8166fe73da10f"
+    },
+    "eval/validation/maple_Medicine.parquet": {
+      "n": 13,
+      "canonical_sha256": "b2d8552864e14664299318211d9a13efda23aeeef3cd30eb1f93326079f84028"
+    },
+    "eval/validation/maple_Physics.parquet": {
+      "n": 13,
+      "canonical_sha256": "99f403718a5dea58637330c93eaa30b8834577948915ed7ce6157a348255f68a"
+    },
+    "eval/test/biomedical.parquet": {
+      "n": 54,
+      "canonical_sha256": "e0e5506eeb00b15484e45e807ac0153dd4a3e37dbc5daad62ee62a97c374815f"
+    },
+    "eval/test/dblp.parquet": {
+      "n": 30,
+      "canonical_sha256": "49cfa8dd9a454fba2aa7ab3292d663131e3999ca8fc82c3c1d72ea6d56d782ad"
+    },
+    "eval/test/maple_Biology.parquet": {
+      "n": 26,
+      "canonical_sha256": "54bb888649520d83ebb97113edecb42560d9f8fbe784bc163b72a6ce2bef18cd"
+    },
+    "eval/test/maple_Chemistry.parquet": {
+      "n": 26,
+      "canonical_sha256": "cbace0ac608551fda73e4bb0ba74d197e9011999a755f6249a5fb7e15593d2b1"
+    },
+    "eval/test/maple_Materials_Science.parquet": {
+      "n": 26,
+      "canonical_sha256": "22fc2dbcfccda8a18e93d08f4df7b613835f3016bdde511df51e965f05ad5e81"
+    },
+    "eval/test/maple_Medicine.parquet": {
+      "n": 26,
+      "canonical_sha256": "d7fc3503793008eb5b950ff820688798f8986243504545d16d1e772b98021368"
+    },
+    "eval/test/maple_Physics.parquet": {
+      "n": 26,
+      "canonical_sha256": "a598b66b97a60c8ddb277aa72425822b6aeb8bb9a8a7d035d858107886068ccf"
+    },
+    "eval/ood/amazon.parquet": {
+      "n": 200,
+      "canonical_sha256": "4736ddd6a6ed02c9f8f5cb390fb5babab2e8d24470fdaefc23ddf7017c29dc71"
+    },
+    "eval/ood/goodreads.parquet": {
+      "n": 240,
+      "canonical_sha256": "55ab8bbfd3410c1dcfffd6f157d0b5d47ca48afc096e2ac1a868618e7c85af97"
+    },
+    "eval/ood/legal.parquet": {
+      "n": 180,
+      "canonical_sha256": "388b9ce9eb07a1ccd372226a31e15a3eba8ffa918fe0729d9c4bffdcc2da44c2"
+    }
+  },
+  "hashing": "canonical_sha256 = sha256(json.dumps(records, sort_keys=True, ensure_ascii=False)) over the list of records written to each parquet file"
+}

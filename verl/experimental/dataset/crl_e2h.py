@@ -1,9 +1,27 @@
-# Copyright 2025
+# Copyright 2025 GraphDancer Contributors
 #
-# E2H (Easy-to-Hard) curriculum samplers adapted for latest VERL.
-# Integrates Graph-RL's Gaussian/Cosine schedulers with VERL's
-# AbstractCurriculumSampler interface so they can be configured via
-# data.sampler.{class_path,class_name}.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Graph-aware easy-to-hard (E2H) curriculum samplers for verl.
+#
+# E2HGaussianSampler implements the GraphDancer schedule: at update t a Gaussian
+# over difficulty levels moves from Easy toward Hard (mu_t = (K-1)(t/(T-1))^beta),
+# and is mixed with a fixed level prior q by a linearly increasing weight eta_t:
+#     p_t = (1 - eta_t) * g_t + eta_t * q.
+# Each update draws per-level counts from Multinomial(batch_size, p_t) and takes
+# questions from per-level shuffled queues (reshuffled when exhausted).
+# Schedule controls (data.e2h_schedule_mode): forward | static | reverse | fast.
+# Enabled with data.use_e2h=true (see verl.trainer.main_ppo.create_rl_sampler).
 
 from __future__ import annotations
 
@@ -72,6 +90,7 @@ class _BaseE2HSampler(AbstractCurriculumSampler):
             t_used = min(int(self.global_t), max(1, int(self.total_training_steps)) - 1)
             probs = self._probs_for_step(t_used)
             self._last_probs = {b: float(probs[i]) for i, b in enumerate(self.bucket_names)}
+
             counts = self.rng.multinomial(self.batch_size, probs)
             batch_indices: List[int] = []
             for i, b in enumerate(self.bucket_names):
@@ -109,12 +128,11 @@ class _BaseE2HSampler(AbstractCurriculumSampler):
         # For this deterministic scheduler we do not need per-batch feedback to update schedule
         return
 
-    # Graph-RL compatibility: expose sampler distribution of last step
+    # Expose the sampler distribution of the last step (logged as sampler/p_{bucket})
     def get_last_probs(self) -> Dict[str, float]:
         """Return the last step's bucket probabilities.
 
-        Matches Graph-RL's sampler API so training loop can log
-        metrics like `sampler/p_{bucket}`.
+        The training loop logs these as `sampler/p_{bucket}`.
         """
         return dict(self._last_probs)
 
@@ -199,7 +217,7 @@ class _BaseE2HSampler(AbstractCurriculumSampler):
 
     # ------- helpers -------
     def _build_buckets(self, buckets_order: Optional[List[str]], difficulty_key: Optional[str]):
-        # Mirror Graph-RL semantics but support both HF datasets.Dataset and pandas.DataFrame.
+        # Support both HF datasets.Dataset and pandas.DataFrame.
         df = self.df
 
         def _extract_nested_value(val, nested_key: str):
@@ -376,7 +394,14 @@ class E2HGaussianSampler(_BaseE2HSampler):
         self.mix_eta_start = data_config.get("e2h_mix_eta_start", None)
         self.mix_eta_end = data_config.get("e2h_mix_eta_end", None)
         self.mix_q = data_config.get("e2h_mix_q", None)
+        self.schedule_mode = data_config.get("e2h_schedule_mode", "forward")
+        if self.schedule_mode not in {"forward", "static", "reverse", "fast"}:
+            raise ValueError(f"Unknown E2H schedule mode: {self.schedule_mode}")
         super().__init__(data_source, data_config)
+        if self.schedule_mode == "static":
+            self.static_probs = np.mean([
+                self._forward_probs_for_step(t) for t in range(self.total_training_steps)
+            ], axis=0)
 
     def _eta_t(self, t: int) -> float:
         """Return eta(t) in [0, 1]."""
@@ -465,6 +490,17 @@ class E2HGaussianSampler(_BaseE2HSampler):
         return q / S
 
     def _probs_for_step(self, t: int) -> np.ndarray:
+        T = max(1, int(self.total_training_steps))
+        if self.schedule_mode == "static":
+            return self.static_probs.copy()
+        if self.schedule_mode == "reverse":
+            t = max(0, T - 1 - t)
+        elif self.schedule_mode == "fast":
+            horizon = max(1, T // 2)
+            t = min(t / max(1, horizon - 1), 1.0) * (T - 1)
+        return self._forward_probs_for_step(t)
+
+    def _forward_probs_for_step(self, t: int) -> np.ndarray:
         # xt = ((t / (T-1))^beta) * (K-1), where T is total_training_steps
         T = max(1, int(self.total_training_steps))
         if T <= 1:

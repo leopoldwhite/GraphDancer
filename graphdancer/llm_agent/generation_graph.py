@@ -1,3 +1,6 @@
+# Copyright 2025 GraphDancer Contributors
+# SPDX-License-Identifier: Apache-2.0
+# Adapted from the multi-turn generation manager of Search-R1 (Apache-2.0).
 import torch
 import re
 from collections import defaultdict
@@ -11,8 +14,33 @@ from verl import DataProto
 from verl.utils.tracking import Tracking
 import shutil
 
-# Tools ported from GraphAgent
+# Graph tools (GRBench / Graph-CoT function interface)
 from .tools import graph_funcs as graph_funcs_mod
+
+
+def _verify_masked_append(previous, response, observation, actual, pad_id):
+    """Check token origins independently of the production padding sort."""
+    expected_mask = torch.zeros_like(actual['responses'], dtype=torch.bool)
+    for row in range(response.shape[0]):
+        old_tokens = previous['responses'][row]
+        old_valid = old_tokens != pad_id
+        new_tokens = response[row][response[row] != pad_id]
+        tokens = [old_tokens[old_valid], new_tokens]
+        origins = [previous['protocol_expected_mask'][row][old_valid], torch.ones_like(new_tokens, dtype=torch.bool)]
+        if observation is not None:
+            obs_tokens = observation[row][observation[row] != pad_id]
+            tokens.append(obs_tokens)
+            origins.append(torch.zeros_like(obs_tokens, dtype=torch.bool))
+        expected_tokens = torch.cat(tokens)[:actual['responses'].shape[1]]
+        expected_origins = torch.cat(origins)[:actual['responses'].shape[1]]
+        length = expected_tokens.numel()
+        expected_mask[row, :length] = expected_origins
+        if not torch.equal(actual['responses'][row, :length], expected_tokens) or \
+                torch.any(actual['responses'][row, length:] != pad_id):
+            raise RuntimeError("Protocol token order changed while appending a generated turn and observation")
+    if not torch.equal(actual['responses_with_info_mask'] != pad_id, expected_mask):
+        raise RuntimeError("Protocol mask includes observation tokens or excludes generated tokens")
+    return expected_mask
 
 
 @dataclass
@@ -46,6 +74,13 @@ class GenerationConfig:
     # Trace collection (disabled by default to avoid training overhead).
     # When enabled, per-sample traces (per turn: prediction/action/observation) are stored into DataProto.non_tensor_batch["__trace__"].
     collect_trace: bool = False
+    # Optional continuation prefix appended after every observation ("<think>" for
+    # Qwen3 thinking mode). It is environment context and is masked from the loss.
+    continuation_prefix: str = ""
+
+    def __post_init__(self):
+        if self.continuation_prefix not in ("", "<think>"):
+            raise ValueError("continuation_prefix must be empty or '<think>'")
 
 
 class LLMGenerationManager:
@@ -209,6 +244,16 @@ class LLMGenerationManager:
     def _process_next_obs(self, next_obs: List[str]) -> torch.Tensor:
         """Process next observations from environment."""
 
+        if self.config.continuation_prefix:
+            prefix = self.tokenizer.encode(self.config.continuation_prefix, add_special_tokens=False)
+            budget = self.config.max_obs_length - len(prefix)
+            if budget < 1:
+                raise ValueError("max_obs_length must leave room for the observation and continuation prefix")
+            rows = self.tokenizer(next_obs, add_special_tokens=False)['input_ids']
+            # The prefix is environment context, covered by the observation's existing PPO mask.
+            rows = [ids[:budget] + prefix if text else [] for text, ids in zip(next_obs, rows)]
+            return self.tokenizer.pad({'input_ids': rows}, padding='longest', return_tensors='pt')['input_ids']
+
         next_obs_ids = self.tokenizer(
             next_obs,
             padding='longest',
@@ -237,6 +282,8 @@ class LLMGenerationManager:
 
         # Cut to appropriate length
         effective_len = new_attention_mask.sum(dim=1).max()
+        if os.environ.get("GD_VERIFY_PROTOCOL") == "1" and effective_len > self.config.max_prompt_length:
+            raise RuntimeError("Protocol rolling context would drop tokens; increase max_prompt_length or reduce the trajectory budget")
         max_len = min(self.config.max_prompt_length, effective_len)
 
         new_rollings = DataProto.from_dict({
@@ -292,9 +339,32 @@ class LLMGenerationManager:
                 pad_to_left=False,
             )
         effective_len = self.tensor_fn.create_attention_mask(responses).sum(dim=1).max()
+        if os.environ.get("GD_VERIFY_PROTOCOL") == "1" and effective_len > self.config.max_prompt_length:
+            raise RuntimeError("Protocol final trajectory would drop tokens; increase max_prompt_length or reduce the trajectory budget")
         max_len = min(self.config.max_prompt_length, effective_len)
 
-        return {'responses': responses[:, :max_len], 'responses_with_info_mask': responses_with_info_mask[:, :max_len]}
+        result = {'responses': responses[:, :max_len], 'responses_with_info_mask': responses_with_info_mask[:, :max_len]}
+        if os.environ.get("GD_VERIFY_PROTOCOL") == "1":
+            result['protocol_expected_mask'] = _verify_masked_append(
+                right_side, cur_responses, next_obs_ids, result, self.tokenizer.pad_token_id)
+        return result
+
+    def _record_protocol_turn(self, evidence, active, generated, responses, observations, predictions, turn, phase):
+        names = ("generated_tokens", "response_limit", "at_limit", "length_stop")
+        raw = [generated.batch[f"protocol_{name}"].tolist() for name in names]
+        active_rows = active.nonzero().flatten().tolist()
+        if any(len(values) != len(active_rows) for values in raw):
+            raise RuntimeError("Protocol lengths lost alignment with active rollout rows")
+        actions, _ = self.postprocess_predictions(predictions)
+        for source, row in enumerate(active_rows):
+            values = dict(zip(names, (int(column[source]) for column in raw)))
+            if not 0 <= values['generated_tokens'] <= values['response_limit']:
+                raise RuntimeError("Protocol generated-token count exceeds the sampled token limit")
+            values.update(turn=turn, phase=phase, action=actions[row],
+                          retained_action_tokens=int((responses[row] != self.tokenizer.pad_token_id).sum()),
+                          observation_tokens=int((observations[row] != self.tokenizer.pad_token_id).sum())
+                          if observations is not None else 0)
+            evidence[row]['turns'].append(values)
 
     def _generate_with_gpu_padding(self, active_batch: DataProto) -> DataProto:
         """
@@ -389,6 +459,14 @@ class LLMGenerationManager:
 
         original_left_side = {'input_ids': initial_input_ids[:, -self.config.max_start_length:]}
         original_right_side = {'responses': initial_input_ids[:, []], 'responses_with_info_mask': initial_input_ids[:, []]}
+        verify_protocol = os.environ.get("GD_VERIFY_PROTOCOL") == "1"
+        if verify_protocol:
+            pad_id = self.tokenizer.pad_token_id
+            if any(not torch.equal(full[full != pad_id], initial[initial != pad_id])
+                   for full, initial in zip(gen_batch.batch['input_ids'], original_left_side['input_ids'], strict=True)):
+                raise RuntimeError("Protocol initial PPO prompt differs from the full rollout prompt; increase max_start_length")
+            original_right_side['protocol_expected_mask'] = torch.zeros_like(initial_input_ids[:, []], dtype=torch.bool)
+            protocol_evidence = [{'version': 1, 'turns': []} for _ in range(bsz)]
 
         active_mask = torch.ones(gen_batch.batch['input_ids'].shape[0], dtype=torch.bool)
         turns_stats = torch.ones(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
@@ -414,6 +492,8 @@ class LLMGenerationManager:
             )
 
             rollings_active = DataProto.from_dict({k: v[active_mask] for k, v in rollings.batch.items()})
+            if verify_protocol:
+                protocol_active = active_mask.clone()
             gen_output = self._generate_with_gpu_padding(rollings_active)
 
             meta_info = gen_output.meta_info
@@ -458,6 +538,9 @@ class LLMGenerationManager:
             valid_search_stats += torch.tensor(is_search, dtype=torch.int)
 
             next_obs_ids = self._process_next_obs(next_obs)
+            if verify_protocol:
+                self._record_protocol_turn(protocol_evidence, protocol_active, gen_output, responses_ids,
+                                           next_obs_ids, responses_str, step, 'loop')
 
             # Update states
             rollings = self._update_rolling_state(rollings, responses_ids, next_obs_ids)
@@ -471,6 +554,8 @@ class LLMGenerationManager:
             )
 
             rollings_active = DataProto.from_dict({k: v[active_mask] for k, v in rollings.batch.items()})
+            if verify_protocol:
+                protocol_active = active_mask.clone()
             gen_output = self._generate_with_gpu_padding(rollings_active)
 
             meta_info = gen_output.meta_info
@@ -514,6 +599,9 @@ class LLMGenerationManager:
             valid_action_stats += torch.tensor(valid_action, dtype=torch.int)
             valid_search_stats += torch.tensor(is_search, dtype=torch.int)
 
+            if verify_protocol:
+                self._record_protocol_turn(protocol_evidence, protocol_active, gen_output, responses_ids,
+                                           None, responses_str, self.config.max_turns, 'final')
             original_right_side = self._update_right_side(original_right_side, responses_ids)
 
         meta_info['turns_stats'] = turns_stats.tolist()
@@ -524,6 +612,16 @@ class LLMGenerationManager:
         print("ACTIVE_TRAJ_NUM:", active_num_list)
 
         dp = self._compose_final_output(original_left_side, original_right_side, meta_info)
+        if verify_protocol:
+            expected_mask = dp.batch['protocol_expected_mask']
+            if not torch.equal(dp.batch['info_mask'][:, -expected_mask.shape[1]:].bool(), expected_mask):
+                raise RuntimeError("Protocol info_mask changed during final output composition")
+            for row, evidence in enumerate(protocol_evidence):
+                evidence.update(mask_alignment_verified=True,
+                                retained_generated_tokens=int(expected_mask[row].sum()),
+                                retained_observation_tokens=int((dp.batch['responses'][row] != self.tokenizer.pad_token_id).sum())
+                                - int(expected_mask[row].sum()))
+            dp.non_tensor_batch['__protocol__'] = np.array(protocol_evidence, dtype=object)
         if collect_trace and traces is not None:
             dp.non_tensor_batch["__trace__"] = np.array(traces, dtype=object)
         return dp
@@ -653,7 +751,7 @@ class LLMGenerationManager:
 
         return actions, contents
 
-    # Graph execution helpers (ported from GraphAgent)
+    # Graph execution helpers (GRBench graph functions)
     def _execute_graph(self, action_type: str, argument: str, graph_funcs, node_retriever) -> str:
         try:
             if graph_funcs is None or node_retriever is None:
@@ -699,7 +797,7 @@ class LLMGenerationManager:
             return f'Internal error during graph execution: {e}'
 
 
-# === Helper parsing functions (ported) ===
+# === Helper parsing functions ===
 def parse_graph_call(graph_block: str) -> Tuple[Optional[str], Optional[str]]:
     """Parse a graph call block into (FunctionName, arg_str)."""
     gb = (graph_block or '').strip()
@@ -728,4 +826,3 @@ def remove_quotes(s: str) -> str:
     if (s.startswith(("'", '"')) and s.endswith(("'", '"'))) and len(s) >= 2:
         return s[1:-1]
     return s
-

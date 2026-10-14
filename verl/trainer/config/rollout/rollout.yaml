@@ -95,7 +95,7 @@ disable_log_stats: True
 # Whether to sample during training rollout. False uses greedy sampling.
 do_sample: True
 
-# number of responses (i.e. num sample times). > 1 for grpo
+# number of responses (i.e. num sample times) per prompt.
 n: 1
 
 # The over_sample_rate parameter controls the early termination threshold for training rollouts,

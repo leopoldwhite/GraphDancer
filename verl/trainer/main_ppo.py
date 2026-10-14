@@ -346,7 +346,7 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
             )
     elif "datagen" in data_config and data_config.datagen.get("path", None) is not None and is_train:
         # If a data generation strategy is specified, use the DynamicGenDataset class
-        from verl.utils.dataset.dynamicgen_dataset import DynamicGenDataset
+        from verl.experimental.dynamic_dataset.dynamicgen_dataset import DynamicGenDataset
 
         dataset_cls = DynamicGenDataset
         print("Using DynamicGenDataset for data generation.")
@@ -379,8 +379,8 @@ def create_rl_sampler(data_config, dataset):
     import torch
     from torch.utils.data import RandomSampler, SequentialSampler
 
-    # Graph-RL compatibility: allow enabling E2H curriculum via simple flags
-    # This path uses built-in E2H samplers adapted to VERL's sampler API.
+    # Graph-aware curriculum (GraphDancer): data.use_e2h=true selects the built-in
+    # easy-to-hard samplers in verl.experimental.dataset.crl_e2h.
     if data_config.get("use_e2h", False):
         from verl.experimental.dataset.crl_e2h import E2HCosineSampler, E2HGaussianSampler
 

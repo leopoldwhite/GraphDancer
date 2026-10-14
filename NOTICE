@@ -1,0 +1,29 @@
+GraphDancer
+Copyright 2025-2026 GraphDancer Contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It includes a modified copy of verl (https://github.com/volcengine/verl),
+Copyright 2024-2025 Bytedance Ltd. and/or its affiliates and the verl contributors,
+licensed under the Apache License, Version 2.0. Original copyright and license
+headers are retained in the files under verl/. Modifications for GraphDancer
+include the multi-turn graph-agent rollout hook, the format-aware rule-based
+reward, the graph-aware curriculum sampler (verl/experimental/dataset/crl_e2h.py),
+per-question evaluation output, and checkpoint-retention safeguards. Some trainers
+and advantage estimators that GraphDancer does not use were removed; GraphDancer
+uses the PPO (GAE) path.
+
+verl in turn contains code derived from third-party projects (e.g. Hugging Face
+Transformers, vLLM, SGLang, PyTorch, Megatron-LM); see the headers of the
+respective files.
+
+The multi-turn rollout loop and the exact-match reward follow the design of
+Search-R1 (https://github.com/PeterGriffinJin/Search-R1, Apache License 2.0).
+
+The graph environments, graph functions (RetrieveNode, NodeFeature,
+NeighbourCheck, NodeDegree), the GRBench questions, the in-context
+demonstrations embedded in data/split701020_v1/prompt_templates.json, and the
+GPTScore judge prompt come from Graph-CoT / GRBench
+(https://github.com/PeterGriffinJin/Graph-CoT). The GRBench data are not
+redistributed here except for question identifiers, frozen labels and prompt
+templates; obtain the data from the original release and follow its terms.

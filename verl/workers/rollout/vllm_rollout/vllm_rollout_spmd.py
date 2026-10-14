@@ -207,7 +207,7 @@ class vLLMRollout(BaseRollout):
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_prefix_caching=config.enable_prefix_caching,
             trust_remote_code=trust_remote_code,
-            seed=config.get("seed", 0),
+            seed=int(os.environ.get("VERL_ROLLOUT_SEED", config.get("seed", 0))),
             **compilation_config,
             **self.lora_kwargs,
             **engine_kwargs,
@@ -353,10 +353,15 @@ class vLLMRollout(BaseRollout):
 
             response = []
             rollout_log_probs = []
+            protocol_lengths = [] if os.environ.get("GD_VERIFY_PROTOCOL") == "1" else None
             for output in outputs:
                 for sample_id in range(len(output.outputs)):
                     response_ids = output.outputs[sample_id].token_ids
                     response.append(response_ids)
+                    if protocol_lengths is not None:
+                        limit = self.sampling_params.max_tokens
+                        protocol_lengths.append((len(response_ids), limit, int(len(response_ids) == limit),
+                                                 int(output.outputs[sample_id].finish_reason == "length")))
                     if self.config.calculate_log_probs:
                         curr_log_prob = []
                         for i, logprob in enumerate(output.outputs[sample_id].logprobs):
@@ -402,6 +407,10 @@ class vLLMRollout(BaseRollout):
             },
             batch_size=batch_size,
         )
+        if protocol_lengths is not None:
+            for column, name in enumerate(("generated_tokens", "response_limit", "at_limit", "length_stop")):
+                batch[f"protocol_{name}"] = torch.tensor([row[column] for row in protocol_lengths],
+                                                         dtype=torch.int64, device=idx.device)
         if self.config.calculate_log_probs:
             # we will recompute old log prob with actor
             batch["rollout_log_probs"] = rollout_log_probs

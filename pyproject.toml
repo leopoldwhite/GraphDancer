@@ -12,13 +12,13 @@ build-backend = "setuptools.build_meta"
 # project (PEP 621 metadata)
 # -------------------------------
 [project]
-name = "verl"
+name = "graphdancer"
 # We'll mark the version as "dynamic" because it's read from the file "verl/version/version" 
 # (PEP 621 calls this "dynamic version"). 
 # The actual version is specified in the [tool.setuptools.dynamic] section below.
-dynamic = ["version", "dependencies", "optional-dependencies", "authors", "urls"]
+dynamic = ["version", "dependencies", "optional-dependencies"]
 
-description = "verl: Volcano Engine Reinforcement Learning for LLM"
+description = "GraphDancer: curriculum PPO for LLM agents that explore and reason over graphs (built on verl)"
 license = {text = "Apache-2.0"}  # Changed from file to text format
 readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.10"
@@ -30,10 +30,10 @@ requires-python = ">=3.10"
 # Note: While the formatter will attempt to format lines such that they remain within the line-length,
 # it isn't a hard upper bound, and formatted lines may exceed the line-length.
 line-length = 120
-exclude = ["tests/workers/rollout/test_sglang_async_rollout_sf_tools.py", "scripts/legacy_model_merger.py"]
+exclude = []
 
 [tool.ruff.lint]
-isort = {known-first-party = ["verl"]}
+isort = {known-first-party = ["verl", "graphdancer"]}
 # c.f. https://github.com/vllm-project/vllm/blob/ce8d6b75fc0586045df75ee1568a5b5f9957251b/pyproject.toml
 select = [
     # pycodestyle
@@ -102,6 +102,10 @@ version = {file = "verl/version/version"}
 # If you need to mimic `package_dir={'': '.'}`:
 [tool.setuptools.package-dir]
 "" = "."
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["verl", "verl.*", "graphdancer", "graphdancer.*"]
 
 # If you need to include specific non-Python data (like YAML files or version file):
 # This is the rough equivalent of package_data={'': ['version/*'], 'verl': ['trainer/config/*.yaml']}

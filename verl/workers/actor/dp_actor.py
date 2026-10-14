@@ -45,6 +45,26 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _parameter_update_probe(optimizer):
+    """Sample one gradient-active local parameter element without changing RNG."""
+    for group in optimizer.param_groups:
+        for parameter in group["params"]:
+            if parameter.grad is None:
+                continue
+            gradient = parameter.grad.detach()
+            if isinstance(gradient, DTensor):
+                gradient = gradient.to_local()
+            if not gradient.numel():
+                continue
+            magnitude, index = gradient.reshape(-1).abs().max(dim=0)
+            if torch.isfinite(magnitude) and magnitude > 0:
+                local = parameter.detach()
+                if isinstance(local, DTensor):
+                    local = local.to_local()
+                return parameter, index.item(), local.reshape(-1)[index].item()
+    return None
+
+
 class DataParallelPPOActor(BasePPOActor):
     """FSDP DataParallel PPO Actor or Ref worker
 
@@ -274,6 +294,9 @@ class DataParallelPPOActor(BasePPOActor):
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
+        verify_update = os.environ.get("GD_VERIFY_UPDATES") == "1"
+        if verify_update:
+            self.parameter_delta_max = 0.0
 
         if isinstance(self.actor_module, FSDP):
             grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
@@ -290,7 +313,20 @@ class DataParallelPPOActor(BasePPOActor):
             print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
             self.actor_optimizer.zero_grad()
         else:
+            probe = _parameter_update_probe(self.actor_optimizer) if verify_update else None
             self.actor_optimizer.step()
+            if probe is not None:
+                parameter, index, before = probe
+                local = parameter.detach()
+                if isinstance(local, DTensor):
+                    local = local.to_local()
+                self.parameter_delta_max = abs(local.reshape(-1)[index].item() - before)
+        if verify_update:
+            # MAX is over one sampled element per rank, not every model weight.
+            delta = grad_norm.new_tensor(self.parameter_delta_max)
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(delta, op=torch.distributed.ReduceOp.MAX)
+            self.parameter_delta_max = delta.item()
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
@@ -490,6 +526,8 @@ class DataParallelPPOActor(BasePPOActor):
 
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
+                if os.environ.get("GD_VERIFY_UPDATES") == "1":
+                    mini_batch_metrics["actor/parameter_delta_max"] = self.parameter_delta_max
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         return metrics

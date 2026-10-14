@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import fcntl
 import json
 import logging
 import os
+import re
 import warnings
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -176,6 +179,117 @@ class FSDPCheckpointManager(BaseCheckpointManager):
 
         # wait for everyone to load checkpoints
         torch.distributed.barrier()
+        self.loaded_checkpoint_path = os.path.abspath(local_path)
+
+    def _prune_checkpoints_before_save(self, local_path, global_step, max_ckpt_to_keep):
+        """Reserve a save slot; keep >= 2 preserves fallback, keep = 1 retains legacy destructive rotation."""
+        target = Path(local_path).absolute()
+        role = target.name if target.name in ("actor", "critic") else None
+        step_dir = target.parent if role else target
+        match = re.fullmatch(r"global_step_(\d+)", step_dir.name)
+        if not match or int(match.group(1)) != global_step or target.is_symlink() or step_dir.is_symlink():
+            raise ValueError(f"Cannot safely rotate checkpoint path: {local_path}")
+        root = step_dir.parent.resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        target = root / step_dir.name / role if role else root / step_dir.name
+
+        # The merger holds a shared lock for its entire read of a source generation.
+        with open(root / ".checkpoint_retention.lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            checkpoints = {}
+            for sibling in root.iterdir():
+                sibling_match = re.fullmatch(r"global_step_(\d+)", sibling.name)
+                if not sibling_match or sibling.is_symlink() or not sibling.is_dir():
+                    continue
+                path = sibling / role if role else sibling
+                if path.is_symlink() or not path.is_dir():
+                    continue
+                # Include interrupted writes, but leave unrelated directories and metadata stubs alone.
+                if any(
+                    entry.is_file()
+                    and not entry.is_symlink()
+                    and (
+                        entry.name == "fsdp_config.json"
+                        or re.fullmatch(r"(?:model|optim|extra_state)_world_size_\d+_rank_\d+\.pt", entry.name)
+                    )
+                    for entry in path.iterdir()
+                ):
+                    checkpoints[path] = int(sibling_match.group(1))
+
+            tracker = root / "latest_checkpointed_iteration.txt"
+            committed_step = int(tracker.read_text().strip()) if tracker.exists() else None
+            protected = {path for path, step in checkpoints.items() if step >= global_step and path != target}
+            fallback = set()
+            if committed_step is not None:
+                committed = root / f"global_step_{committed_step}"
+                committed = committed / role if role else committed
+                if committed == target:
+                    raise RuntimeError(f"Refusing to overwrite committed checkpoint: {target}")
+                if max_ckpt_to_keep >= 2:
+                    if committed not in checkpoints:
+                        raise RuntimeError(f"Committed checkpoint is missing its FSDP state: {committed}")
+                    if role and not (committed.parent / "data.pt").is_file():
+                        raise RuntimeError(f"Committed checkpoint is missing dataloader state: {committed.parent}")
+                    fallback.add(committed)
+
+            loaded = getattr(self, "loaded_checkpoint_path", None)
+            if loaded is not None and max_ckpt_to_keep >= 2:
+                loaded = Path(loaded).resolve()
+                if loaded in checkpoints and (committed_step is None or committed_step <= checkpoints[loaded]):
+                    fallback.add(loaded)
+            if max_ckpt_to_keep >= 2 and committed_step is None and not fallback:
+                previous = [Path(path).resolve() for path in self.previous_saved_paths]
+                previous = [path for path in previous if path in checkpoints and path != target]
+                if previous:
+                    fallback.add(max(previous, key=checkpoints.get))
+                elif any(path != target for path in checkpoints):
+                    raise RuntimeError(f"Cannot rotate existing checkpoints without a committed resume marker: {root}")
+
+            for path in fallback:
+                required = {"model": "model", "optimizer": "optim", "extra": "extra_state"}
+                for content, prefix in required.items():
+                    if content in self.checkpoint_load_contents:
+                        for rank in range(self.world_size):
+                            shard = path / f"{prefix}_world_size_{self.world_size}_rank_{rank}.pt"
+                            if not shard.is_file() or shard.stat().st_size == 0:
+                                raise RuntimeError(f"Resume checkpoint is missing a required shard: {shard}")
+            protected.update(fallback)
+
+            slots = max_ckpt_to_keep - 1
+            if len(protected) > slots or target in protected:
+                raise RuntimeError(
+                    f"Checkpoint keep limit {max_ckpt_to_keep} cannot preserve the complete resume checkpoint "
+                    f"and active/newer checkpoints in {root}; more save slots are needed."
+                )
+            remaining = sorted(
+                (path for path in checkpoints if path != target and path not in protected),
+                key=checkpoints.get,
+                reverse=True,
+            )
+            keep = protected | set(remaining[: slots - len(protected)])
+            remove = [str(path) for path in remaining if path not in keep]
+            export_manifest = root / ".required_hf_exports.json"
+            if export_manifest.exists():
+                from .hf_checkpoint import check as check_hf
+
+                exports = json.loads(export_manifest.read_text())
+                steps = exports["steps"]
+                hf_root = Path(exports["hf_root"])
+                if (not isinstance(steps, list) or not steps
+                    or any(type(step) is not int or step <= 0 for step in steps)
+                    or len(steps) != len(set(steps)) or not hf_root.is_absolute()
+                    or hf_root.name != root.name):
+                    raise ValueError(f"Invalid required HF exports: {export_manifest}")
+                # Check every export before deleting any role; never wait under the merger lock.
+                for path in remove:
+                    step = checkpoints[Path(path)]
+                    if step in steps:
+                        try:
+                            check_hf(hf_root / f"step_{step}", step)
+                        except Exception as exc:
+                            raise RuntimeError(f"Refusing to delete checkpoint {step}: HF export is not verified") from exc
+            self.remove_previous_save_local_path(remove)
+            self.previous_saved_paths = [str(path) for path in sorted(keep, key=checkpoints.get)]
 
     def save_checkpoint(self, local_path: str, hdfs_path: str = None, global_step: int = 0, max_ckpt_to_keep=None):
         """
@@ -201,17 +315,21 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         # record the previous global step
         self.previous_global_step = global_step
 
-        # remove previous local_path, only rank 0 should do this
+        # Rank 0 prunes; communicate errors before the other ranks enter a save barrier.
         if (
-            self.rank == 0
-            and max_ckpt_to_keep
+            max_ckpt_to_keep
             and isinstance(max_ckpt_to_keep, int)
             and max_ckpt_to_keep > 0
-            and len(self.previous_saved_paths) >= max_ckpt_to_keep
         ):
-            keep_start = len(self.previous_saved_paths) - max_ckpt_to_keep + 1
-            self.remove_previous_save_local_path(self.previous_saved_paths[:keep_start])
-            self.previous_saved_paths = self.previous_saved_paths[keep_start:]
+            rotation_error = [None]
+            if self.rank == 0:
+                try:
+                    self._prune_checkpoints_before_save(local_path, global_step, max_ckpt_to_keep)
+                except Exception as exc:
+                    rotation_error[0] = f"Checkpoint rotation failed: {type(exc).__name__}: {exc}"
+            torch.distributed.broadcast_object_list(rotation_error, src=0)
+            if rotation_error[0] is not None:
+                raise RuntimeError(rotation_error[0])
 
         local_path = local_mkdir_safe(local_path)
         torch.distributed.barrier()

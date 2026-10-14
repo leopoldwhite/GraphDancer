@@ -45,6 +45,7 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
+    compute_ppo_diagnostics,
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
@@ -173,11 +174,11 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
     data.batch["token_level_rewards"] = token_level_rewards
 
-    # Report both VERL-style and Graph-RL-style metric names for compatibility
+    # Report both actor-side and critic-side metric names
     metrics = {
         "actor/reward_kl_penalty": current_kl,
         "actor/reward_kl_penalty_coeff": beta,
-        # Graph-RL naming aliases
+        # metric name aliases
         "critic/kl": current_kl,
         "critic/kl_coeff": beta,
     }
@@ -204,28 +205,49 @@ def compute_response_mask(data: DataProto):
     return data.batch["attention_mask"][:, -L:]  # 回退
 
 
+def verify_protocol_batch(batch):
+    """Fail before PPO if token-origin evidence and the consumed masks disagree."""
+    expected = batch.batch["protocol_expected_mask"].bool()
+    width = expected.shape[1]
+    if not torch.equal(batch.batch["response_mask"].bool(), expected) or \
+            not torch.equal(batch.batch["info_mask"][:, -width:].bool(), expected):
+        raise RuntimeError("PPO response/info mask differs from verified token origins")
+    records = batch.non_tensor_batch["__protocol__"]
+    if len(records) != expected.shape[0]:
+        raise RuntimeError("Protocol metadata lost batch alignment before PPO")
+    observed = batch.batch["attention_mask"][:, -width:].bool()
+    turns = []
+    for row, record in enumerate(records):
+        if record["retained_generated_tokens"] != int(expected[row].sum()) or \
+                record["retained_observation_tokens"] != int(observed[row].sum() - expected[row].sum()):
+            raise RuntimeError("Protocol metadata counts differ from the PPO token masks")
+        record["ppo_mask_verified"] = True
+        turns.extend(record["turns"])
+    return {"protocol/verified_records": len(records), "protocol/generated_turns": len(turns),
+            "protocol/at_token_limit": sum(turn["at_limit"] for turn in turns),
+            "protocol/length_stops": sum(turn["length_stop"] for turn in turns),
+            "protocol/at_limit_without_action": sum(turn["at_limit"] and turn["action"] is None for turn in turns)}
+
+
 def compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
     gamma: float = 1.0,
     lam: float = 1.0,
     num_repeat: int = 1,
-    norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
 ) -> DataProto:
     """Compute advantage estimates for policy optimization.
 
-    This function computes advantage estimates using various estimators like GAE, GRPO, REINFORCE++, etc.
+    This function computes advantage estimates using various estimators like GAE, REINFORCE++, etc.
     The advantage estimates are used to guide policy optimization in RL algorithms.
 
     Args:
         data (DataProto): The data containing batched model outputs and inputs.
-        adv_estimator (AdvantageEstimator): The advantage estimator to use (e.g., GAE, GRPO, REINFORCE++).
+        adv_estimator (AdvantageEstimator): The advantage estimator to use (e.g., GAE, REINFORCE++).
         gamma (float, optional): Discount factor for future rewards. Defaults to 1.0.
         lam (float, optional): Lambda parameter for GAE. Defaults to 1.0.
         num_repeat (int, optional): Number of times to repeat the computation. Defaults to 1.
-        norm_adv_by_std_in_grpo (bool, optional): Whether to normalize advantages by standard deviation in
-            GRPO. Defaults to True.
         config (dict, optional): Configuration dictionary for algorithm settings. Defaults to None.
 
     Returns:
@@ -252,21 +274,8 @@ def compute_advantage(
                 config.pf_ppo.get("reweight_method"),
                 config.pf_ppo.get("weight_pow"),
             )
-    elif adv_estimator == AdvantageEstimator.GRPO:
-        # Initialize the mask for GRPO calculation
-        grpo_calculation_mask = data.batch["response_mask"]
-
-        # Call compute_grpo_outcome_advantage with parameters matching its definition
-        advantages, returns = core_algos.compute_grpo_outcome_advantage(
-            token_level_rewards=data.batch["token_level_rewards"],
-            response_mask=grpo_calculation_mask,
-            index=data.non_tensor_batch["uid"],
-            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-        )
-        data.batch["advantages"] = advantages
-        data.batch["returns"] = returns
     else:
-        # handle all other adv estimator type other than GAE and GRPO
+        # handle all other adv estimator types other than GAE
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
         adv_kwargs = {
             "token_level_rewards": data.batch["token_level_rewards"],
@@ -410,8 +419,9 @@ class RayPPOTrainer:
             embed_cache=OmegaConf.select(self.config, "graph.embed_cache"),
             embed_cache_dir=OmegaConf.select(self.config, "graph.embed_cache_dir"),
             domain_graphs=domain_graphs_cfg,
+            continuation_prefix=OmegaConf.select(self.config, "graph.continuation_prefix", default=""),
         )
-        # Optional retriever config (Graph-RL compatibility)
+        # Optional retriever config (unused by the graph environment; kept for compatibility)
         try:
             search_url = OmegaConf.select(self.config, "retriever.url")
             if search_url is not None:
@@ -486,16 +496,16 @@ class RayPPOTrainer:
             train_dataset = create_rl_dataset(
                 self.config.data.train_files, self.config.data, self.tokenizer, self.processor
             )
-        if val_dataset is None:
+        if val_dataset is None and self.config.data.val_files is not None:
             val_dataset = create_rl_dataset(
                 self.config.data.val_files, self.config.data, self.tokenizer, self.processor
             )
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
 
         if train_sampler is None:
-            # If curriculum is enabled, provide total_training_steps to sampler for global scheduling
+            # Default to the training horizon; an explicit curriculum horizon allows early stopping.
             try:
-                if bool(self.config.data.get("use_e2h", False)):
+                if bool(self.config.data.get("use_e2h", False)) and self.config.data.get("e2h_total_training_steps") is None:
                     bs = int(self.config.data.train_batch_size)
                     steps_per_epoch = max(1, len(self.train_dataset) // max(1, bs))
                     trainer_T = int(self.config.trainer.get("total_training_steps", 0) or 0)
@@ -503,7 +513,6 @@ class RayPPOTrainer:
                         total_epochs = int(self.config.trainer.get("total_epochs", 1) or 1)
                         trainer_T = steps_per_epoch * max(1, total_epochs)
                     # inject into data config so sampler can read it
-                    from omegaconf import open_dict
                     with open_dict(self.config.data):
                         self.config.data["e2h_total_training_steps"] = int(trainer_T)
             except Exception:
@@ -525,26 +534,33 @@ class RayPPOTrainer:
             sampler=train_sampler,
         )
 
-        val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
-        if val_batch_size is None:
-            val_batch_size = len(self.val_dataset)
+        if self.val_dataset is not None:
+            val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
+            if val_batch_size is None:
+                val_batch_size = len(self.val_dataset)
 
-        self.val_dataloader = StatefulDataLoader(
-            dataset=self.val_dataset,
-            batch_size=val_batch_size,
-            num_workers=num_workers,
-            shuffle=self.config.data.get("validation_shuffle", True),
-            drop_last=False,
-            collate_fn=collate_fn,
-        )
+            self.val_dataloader = StatefulDataLoader(
+                dataset=self.val_dataset,
+                batch_size=val_batch_size,
+                num_workers=num_workers,
+                shuffle=self.config.data.get("validation_shuffle", True),
+                drop_last=False,
+                collate_fn=collate_fn,
+            )
+        else:
+            self.val_dataloader = None
 
         assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
-        assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
+        if self.val_dataloader is not None:
+            assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
 
-        print(
-            f"Size of train dataloader: {len(self.train_dataloader)}, Size of val dataloader: "
-            f"{len(self.val_dataloader)}"
-        )
+        if self.val_dataloader is not None:
+            print(
+                f"Size of train dataloader: {len(self.train_dataloader)}, Size of val dataloader: "
+                f"{len(self.val_dataloader)}"
+            )
+        else:
+            print(f"Size of train dataloader: {len(self.train_dataloader)}, No validation dataloader")
 
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
 
@@ -609,6 +625,10 @@ class RayPPOTrainer:
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
+            if "extra_info" in batch.non_tensor_batch:
+                reward_extra_infos_to_dump["extra_info"] = batch.non_tensor_batch["extra_info"].tolist()
+            if os.environ.get("GD_VERIFY_PROTOCOL") == "1":
+                reward_extra_infos_to_dump["protocol"] = batch.non_tensor_batch["__protocol__"].tolist()
             if "request_id" in batch.non_tensor_batch:
                 reward_extra_infos_dict.setdefault(
                     "request_id",
@@ -659,7 +679,7 @@ class RayPPOTrainer:
             "uid",
             "question",
             "prompt",
-            # Optional but important for Graph-RL/Graph-CoT style logging:
+            # Optional but important for per-question logging:
             # keep qid if the dataset provides it, so downstream JSONL/TXT logging can name files by qid.
             "qid",
         }) & batch.non_tensor_batch.keys()
@@ -690,7 +710,7 @@ class RayPPOTrainer:
         sample_turns = []
         sample_uids = []
 
-        # Only emit JSONL in eval-only/val-only mode (Graph-RL style)
+        # Only emit JSONL in eval-only/val-only mode
         save_jsonl = bool(self.config.trainer.get("eval_only", False) or self.config.trainer.get("val_only", False))
         base_dir = None
         written_sources = set()
@@ -762,6 +782,7 @@ class RayPPOTrainer:
 
                 # decode model answer
                 prompt_ids = None
+                seq_str = None
                 try:
                     prompt_ids = item.batch.get("prompts")
                     prompt_len = prompt_ids.shape[-1] if prompt_ids is not None else 0
@@ -801,6 +822,11 @@ class RayPPOTrainer:
                     "model_answer": model_answer,
                     "gt_answer": gt_answer,
                 }
+                if "__protocol__" in item.non_tensor_batch:
+                    if seq_str is None:
+                        raise RuntimeError("Protocol evaluation requires the composed response trajectory")
+                    rec["protocol"] = _json_safe(item.non_tensor_batch["__protocol__"])
+                    rec["trajectory"] = seq_str
 
                 # Optional: include trace in JSONL (agent loop per-turn records)
                 trace_include_in_jsonl = bool(self.config.trainer.get("trace_include_in_jsonl", True))
@@ -947,7 +973,7 @@ class RayPPOTrainer:
                 output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
                 sample_outputs.extend(output_texts)
                 test_batch = test_batch.union(final_gen_batch_output)
-                # Graph-RL style JSONL emission (optional)
+                # Per-question JSONL emission (optional)
                 _emit_jsonl_for_batch(test_batch)
             else:
                 # pad to be divisible by dp_size
@@ -972,7 +998,7 @@ class RayPPOTrainer:
                 output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
                 sample_outputs.extend(output_texts)
                 test_batch = test_batch.union(test_output_gen_batch)
-                # Graph-RL style JSONL emission (optional)
+                # Per-question JSONL emission (optional)
                 _emit_jsonl_for_batch(test_batch)
             test_batch.meta_info["validate"] = True
 
@@ -1203,8 +1229,10 @@ class RayPPOTrainer:
         local_latest_checkpointed_iteration = os.path.join(
             self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
         )
-        with open(local_latest_checkpointed_iteration, "w") as f:
+        temporary_tracker = local_latest_checkpointed_iteration + ".tmp"
+        with open(temporary_tracker, "w") as f:
             f.write(str(self.global_steps))
+        os.replace(temporary_tracker, local_latest_checkpointed_iteration)
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
@@ -1262,17 +1290,17 @@ class RayPPOTrainer:
             self.train_dataloader.load_state_dict(dataloader_state_dict)
             # Fallback alignment: old checkpoints may not contain sampler state.
             # Align curriculum sampler global step to the trainer's saved step when mismatched.
-            try:
-                smp = getattr(self.train_dataloader, "sampler", None)
-                if isinstance(smp, AbstractCurriculumSampler) and hasattr(smp, "set_global_step"):
-                    cur_t = getattr(smp, "global_t", None)
-                    if (cur_t is None) or (int(cur_t) != int(self.global_steps)):
-                        smp.set_global_step(int(self.global_steps))
-                        print(
-                            f"Aligned curriculum sampler global_t to {self.global_steps} (post-load mismatch or missing state)."
-                        )
-            except Exception:
-                pass
+            smp = getattr(self.train_dataloader, "sampler", None)
+            if isinstance(smp, AbstractCurriculumSampler) and hasattr(smp, "set_global_step"):
+                # Curriculum uses zero workers. Materialize the lazy restore without drawing
+                # a batch; state_dict also makes fit reuse this iterator on its first iteration.
+                self.train_dataloader.state_dict()
+                cur_t = getattr(smp, "global_t", None)
+                if (cur_t is None) or (int(cur_t) != int(self.global_steps)):
+                    smp.set_global_step(int(self.global_steps))
+                    print(
+                        f"Aligned curriculum sampler global_t to {self.global_steps} (post-load mismatch or missing state)."
+                    )
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
             # If no dataloader state exists, also align curriculum sampler to the saved trainer step.
@@ -1398,6 +1426,10 @@ class RayPPOTrainer:
 
                 gen_batch = self._get_gen_batch(batch)
 
+                # Route metadata must be repeated with the prompts for grouped rollouts.
+                if "extra_info" in batch.non_tensor_batch:
+                    gen_batch.non_tensor_batch["extra_info"] = batch.non_tensor_batch["extra_info"]
+
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
@@ -1409,9 +1441,6 @@ class RayPPOTrainer:
                         from omegaconf import OmegaConf
                         if OmegaConf.select(self.config, "do_search"):
                             self._ensure_generation_manager(is_validation=False)
-                            # include extra_info for routing if available
-                            if "extra_info" in batch.non_tensor_batch:
-                                gen_batch.non_tensor_batch["extra_info"] = batch.non_tensor_batch["extra_info"]
                             first_input_ids = gen_batch.batch["input_ids"][
                                 :, -self.config.data.max_start_length :
                             ].clone()
@@ -1462,6 +1491,8 @@ class RayPPOTrainer:
                     # TODO: Decouple the DP balancing and mini-batching.
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
+                    if os.environ.get("GD_VERIFY_PROTOCOL") == "1":
+                        metrics.update(verify_protocol_batch(batch))
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
@@ -1504,6 +1535,8 @@ class RayPPOTrainer:
                                 ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
+                    metrics.update(compute_ppo_diagnostics(batch, entropys))
+
                     # compute values
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
@@ -1530,17 +1563,12 @@ class RayPPOTrainer:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
                         # compute advantages, executed on the driver process
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get(
-                            "norm_adv_by_std_in_grpo", True
-                        )  # GRPO adv normalization factor
-
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
                             gamma=self.config.algorithm.gamma,
                             lam=self.config.algorithm.lam,
                             num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
 
@@ -1555,7 +1583,7 @@ class RayPPOTrainer:
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
-                            # Graph-RL compatibility: optionally mask state tokens based on info_mask
+                            # Optionally mask observation (state) tokens based on info_mask
                             try:
                                 from omegaconf import OmegaConf
                                 if OmegaConf.select(self.config, "do_search") and getattr(
@@ -1635,7 +1663,7 @@ class RayPPOTrainer:
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
 
-                # Graph-RL compatibility: log search-related env metrics if present
+                # Log graph-interaction env metrics if present
                 try:
                     if 'turns_stats' in batch.meta_info:
                         arr = np.array(batch.meta_info['turns_stats'], dtype=np.int16)
@@ -1679,7 +1707,7 @@ class RayPPOTrainer:
                             for b, p in last_probs.items():
                                 metrics[f"sampler/p_{b}"] = float(p)
 
-                    # Also support batch_sampler path (Graph-RL used batch_sampler)
+                    # Also support the batch_sampler path
                     bs = getattr(self, "train_batch_sampler", None)
                     if bs is None and hasattr(self.train_dataloader, "batch_sampler"):
                         bs = getattr(self.train_dataloader, "batch_sampler")
@@ -1716,7 +1744,7 @@ class RayPPOTrainer:
                     self.train_dataset.on_batch_end(batch=batch)
 
     def _create_loss_mask(self, batch, metrics):
-        """Create loss mask for state tokens based on info_mask (Graph-RL compatibility)."""
+        """Create loss mask for state (observation) tokens based on info_mask."""
         response_length = batch.batch["responses"].shape[-1]
         response_mask = batch.batch["attention_mask"][:, -response_length:]
 

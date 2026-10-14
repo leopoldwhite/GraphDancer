@@ -1,17 +1,27 @@
+# Copyright 2025 GraphDancer Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
-Minimal test for VERL E2H curriculum samplers (Gaussian/Cosine).
+Model-free inspection of the E2H curriculum samplers (Gaussian/Cosine).
 
-This mirrors the Graph-RL mini test but uses VERL's sampler API:
 - Uses torch DataLoader with `sampler=E2H*Sampler` and `batch_size`.
 - The sampler builds buckets from a pandas DataFrame (dataframe column) or
   a HF datasets.Dataset if your RLHFDataset exposes that.
 
-Run examples (from repo root):
+Run (from the repo root; defaults are the paper's GraphDancer schedule):
   python -m verl.experimental.dataset.test_e2h_sampler_min \
-    --train-parquet /path/to/train.parquet \
-    --difficulty-key extra_info.difficulty \
-    --sampler gaussian \
-    --batch-size 128 --epochs 100 --show-steps 200
+    --train-parquet data/grbench/train/train.parquet \
+    --schedule-mode forward --plot e2h_schedule.png
 
 Notes:
 - This script is model-free. It only exercises the sampler and shows batch compositions.
@@ -74,11 +84,13 @@ def simple_collate(batch: List[dict]) -> Dict[str, list]:
     return out
 
 
-def _count_from_extras(extras: List[dict]) -> Dict[str, int]:
+def _count_from_extras(extras: List[dict], label_key: str = "level") -> Dict[str, int]:
     cnt: Counter = Counter()
     for e in extras:
         try:
-            label = str(dict(e).get("difficulty", "None")).lower()
+            if isinstance(e, str):
+                e = json.loads(e)
+            label = str(dict(e).get(label_key, "None")).lower()
         except Exception:
             label = "None"
         cnt[label] += 1
@@ -87,7 +99,7 @@ def _count_from_extras(extras: List[dict]) -> Dict[str, int]:
 
 def run_min_test(
     train_parquet: str,
-    difficulty_key: str = "extra_info.difficulty",
+    difficulty_key: str = "extra_info.level",
     sampler_name: str = "gaussian",
     batch_size: int = 128,
     steps_per_epoch: int | None = None,
@@ -95,12 +107,13 @@ def run_min_test(
     total_training_steps: int | None = 200,
     show_steps: int = 200,
     sigma: float = 0.75,
-    beta: float = 0.25,
+    beta: float = 3.0,
     eps: float = 1e-8,
     mix_eta: float = 0.0,
     mix_eta_start: float | None = None,
     mix_eta_end: float | None = None,
     mix_q=None,
+    schedule_mode: str = "forward",
     seed: int = 42,
     out_plot: str | None = None,
     plot_comp: bool = True,
@@ -133,6 +146,7 @@ def run_min_test(
         "e2h_mix_eta_start": (None if mix_eta_start is None else float(mix_eta_start)),
         "e2h_mix_eta_end": (None if mix_eta_end is None else float(mix_eta_end)),
         "e2h_mix_q": mix_q,
+        "e2h_schedule_mode": str(schedule_mode),
         "seed": int(seed),
         "e2h_total_training_steps": int(T),
     }
@@ -164,7 +178,7 @@ def run_min_test(
             # sampler updates internal _last_probs each step
             last_probs = getattr(loader.sampler, "_last_probs", {})
             buckets = getattr(loader.sampler, "bucket_names", [])
-            comp = _count_from_extras(batch.get("extra_info", []))
+            comp = _count_from_extras(batch.get("extra_info", []), difficulty_key.split(".")[-1])
             print(f"[epoch {epoch} step {i}] probs={{{', '.join(f'{b}:{last_probs.get(b, 0.0):.3f}' for b in buckets)}}} comp={comp}")
             printed += 1
             # record series
@@ -180,9 +194,9 @@ def run_min_test(
         if printed >= int(show_steps):
             break
 
-    print("OK: VERL E2H mini test completed.")
+    print("OK: E2H sampler inspection completed.")
 
-    # Visualization and CSV dump similar to Graph-RL
+    # Visualization and CSV dump
     if out_plot is not None and len(collected_t) > 0 and bucket_names:
         try:
             import matplotlib
@@ -249,15 +263,15 @@ def run_min_test(
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Minimal test for VERL E2H samplers")
+    ap = argparse.ArgumentParser(description="Inspect the E2H curriculum samplers without a model")
     ap.add_argument(
         "--dataset-dir",
         type=str,
-        default=os.environ.get("DATASET_DIR", "./data/grbench_fewshot_merged_biomedical"),
+        default=os.environ.get("DATASET_DIR", "./data/grbench/train"),
         help="Directory containing train.parquet",
     )
     ap.add_argument("--train-parquet", type=str, default=None)
-    ap.add_argument("--difficulty-key", type=str, default="extra_info.difficulty")
+    ap.add_argument("--difficulty-key", type=str, default="extra_info.level")
     ap.add_argument("--sampler", type=str, default="gaussian", help="gaussian or cosine")
     ap.add_argument("--batch-size", type=int, default=128)
     ap.add_argument("--epochs", type=int, default=100)
@@ -269,14 +283,15 @@ def main():
     ap.add_argument("--eps", type=float, default=1e-8)
     # Scheme B (Gaussian mix) knobs
     ap.add_argument("--mix-eta", type=float, default=0.0, help="Gaussian-only: constant eta for p=(1-eta)p_g+eta*q")
-    ap.add_argument("--mix-eta-start", type=float, default=None, help="Gaussian-only: eta schedule start (linear)")
-    ap.add_argument("--mix-eta-end", type=float, default=None, help="Gaussian-only: eta schedule end (linear)")
+    ap.add_argument("--mix-eta-start", type=float, default=0.2, help="Gaussian-only: eta schedule start (linear)")
+    ap.add_argument("--mix-eta-end", type=float, default=0.8, help="Gaussian-only: eta schedule end (linear)")
     ap.add_argument(
         "--mix-q",
         type=str,
-        default="easy",
+        default="[0.34,0.33,0.33]",
         help='Gaussian-only: bias distribution q. Preset: "easy"|"hard"|"uniform", or JSON list "[1,0,0]" or JSON dict \'{"easy":1,"hard":0}\'',
     )
+    ap.add_argument("--schedule-mode", type=str, default="forward", help="forward | static | reverse | fast")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--plot", type=str, default="e2h_schedule.png", help="Output PNG path")
     ap.add_argument("--out-dir", type=str, default=None, help="Optional output directory for plot/csv")
@@ -325,6 +340,7 @@ def main():
         mix_eta_start=args.mix_eta_start,
         mix_eta_end=args.mix_eta_end,
         mix_q=mix_q,
+        schedule_mode=args.schedule_mode,
         seed=int(args.seed),
         out_plot=out_plot,
         plot_comp=(not bool(args.no_plot_comp)),

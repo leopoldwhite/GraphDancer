@@ -1,3 +1,6 @@
+# Copyright 2025 GraphDancer Contributors
+# SPDX-License-Identifier: Apache-2.0
+# Adapted from the multi-turn generation manager of Search-R1 (Apache-2.0).
 import torch
 from typing import Dict, Tuple, List
 from dataclasses import dataclass

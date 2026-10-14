@@ -1,4 +1,4 @@
-#! Graph-RL → VERL: PPO-format config (aligned to Graph-RL defaults)
+# GraphDancer: PPO training config for the multi-turn graph agent (verl fork).
 
 defaults:
   - actor@actor_rollout_ref.actor: dp_actor
@@ -12,9 +12,9 @@ defaults:
 
 data:
   tokenizer: null
-  # Avoid bare '~' in defaults; use ${oc.env:HOME}
-  train_files: ${oc.env:DATA_DIR,${oc.env:HOME}/data/rlhf/gsm8k}/train.parquet
-  val_files: ${oc.env:DATA_DIR,${oc.env:HOME}/data/rlhf/gsm8k}/test.parquet
+  # Parquet files; set by scripts/train_ppo.sh
+  train_files: ${oc.env:DATA_DIR,./data/grbench}/train/train.parquet
+  val_files: null
   train_data_num: null
   val_data_num: null
   prompt_key: prompt
@@ -26,29 +26,33 @@ data:
   val_batch_size: 1312
   return_raw_input_ids: false
   return_raw_chat: false
-  # Graph-RL uses shuffle_train_dataloader; keep both for compatibility
+  # shuffle_train_dataloader is an alias of shuffle; keep both for compatibility
   shuffle_train_dataloader: true
   shuffle: ${data.shuffle_train_dataloader}
-  # Curriculum (E2H) knobs
+  # Graph-aware curriculum (easy-to-hard, E2H). use_e2h=false gives uniform
+  # sampling (Vanilla PPO). Defaults below are the paper's GraphDancer settings.
   use_e2h: false
   e2h_sampler: gaussian   # gaussian | cosine
-  difficulty_key: "extra_info.difficulty"
+  difficulty_key: "extra_info.level"
   buckets: ["easy", "medium", "hard"]
-  e2h_beta: 0.75
+  # Gaussian schedule: mu_t = (K-1) * (t/(T-1))^e2h_beta, std e2h_sigma (kappa=3, sigma=0.75 in the paper)
+  e2h_beta: 3.0
   e2h_sigma: 0.75
   e2h_eps: 1.0e-8
-  # E2H Gaussian (Scheme B): mix Gaussian with a bias distribution q
-  # p(t) = (1 - eta(t)) * p_gauss(t) + eta(t) * q
+  # Biased mixture: p_t = (1 - eta_t) * g_t + eta_t * q
   # - Constant eta: e2h_mix_eta
-  # - Scheduled eta (linear): e2h_mix_eta_start/e2h_mix_eta_end
-  # - q can be:
-  #   - "easy" | "hard" | "uniform"
-  #   - a list of weights aligned with `buckets` (e.g., [1,0,0] for easy)
-  #   - a dict bucket->weight (e.g., {"easy":1,"medium":0,"hard":0})
+  # - Scheduled eta (linear over t in [0, T-1]): e2h_mix_eta_start / e2h_mix_eta_end
+  # - q: list aligned with `buckets`, dict bucket->weight, or "easy" | "hard" | "uniform"
+  # eta_start = eta_end = 0 gives the pure easy-to-hard Gaussian schedule.
   e2h_mix_eta: 0.0
-  e2h_mix_eta_start: null
-  e2h_mix_eta_end: null
-  e2h_mix_q: "easy"
+  e2h_mix_eta_start: 0.2
+  e2h_mix_eta_end: 0.8
+  e2h_mix_q: [0.34, 0.33, 0.33]
+  # Schedule controls: forward (GraphDancer) | static | reverse | fast
+  #   static : fixed level proportions = mean of the forward schedule over T updates
+  #   reverse: forward schedule run from t=T-1 down to 0 (hard to easy)
+  #   fast   : forward schedule compressed into the first T//2 updates, then held
+  e2h_schedule_mode: forward
   # VERL dataloader settings
   dataloader_num_workers: 8
   sampler:
@@ -62,8 +66,8 @@ actor_rollout_ref:
   nccl_timeout: 600
 
   model:
-    # Use HOME instead of '~' to avoid parser issues
-    path: ${oc.env:BASE_MODEL,${oc.env:HOME}/models/deepseek-llm-7b-chat}
+    # Hugging Face model id or local path (overridden by the launchers)
+    path: ${oc.env:BASE_MODEL,Qwen/Qwen2.5-3B-Instruct}
     external_lib: null
     override_config: { }
     enable_gradient_checkpointing: false
@@ -79,9 +83,10 @@ actor_rollout_ref:
     grad_clip: 1.0
     clip_ratio: 0.2
     entropy_coeff: 0.001
-    use_kl_loss: false # True for GRPO
-    kl_loss_coef: 0.001 # for grpo
-    kl_loss_type: low_var_kl # for grpo
+    # Reference-policy KL loss is disabled in all GraphDancer runs.
+    use_kl_loss: false
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
     ppo_epochs: 1
     shuffle: false
     ulysses_sequence_parallel_size: 1 # sp size
@@ -130,7 +135,7 @@ actor_rollout_ref:
     log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
     log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
     do_sample: true
-    n: 1 # > 1 for grpo
+    n: 1 # one rollout per question
     # validation knobs (VERL expects val_kwargs)
     val_kwargs:
       n: 1
@@ -174,7 +179,7 @@ reward_model:
   strategy: fsdp
   model:
     input_tokenizer: ${actor_rollout_ref.model.path}
-    path: ${oc.env:HOME}/models/FsfairX-LLaMA3-RM-v0.1
+    path: null  # model-based reward is disabled (rule-based reward)
     external_lib: ${actor_rollout_ref.model.external_lib}
     use_remove_padding: false
     fsdp_config:
@@ -185,12 +190,13 @@ reward_model:
   ulysses_sequence_parallel_size: 1
   use_dynamic_bsz: ${critic.use_dynamic_bsz}
   forward_max_token_len_per_gpu: ${critic.forward_max_token_len_per_gpu}
-  structure_format_score: 0
-  final_format_score: 0
+  # R = 0.8E + 0.2F + 0.1A(1-E)(1-F): structure 0.2, final format 0.1, retrieval 0
+  structure_format_score: 0.2
+  final_format_score: 0.1
   retrieval_score: 0
 
 retriever:
-  url: "http://127.0.0.1:8000/retrieve"
+  url: null  # unused: the graph environment runs in-process
   topk: 3
 
 # custom reward function definition
@@ -208,7 +214,6 @@ algorithm:
   gamma: 1.0
   lam: 1.0
   adv_estimator: gae
-  norm_adv_by_std_in_grpo: True
   use_kl_in_reward: False
   kl_penalty: kl
   kl_ctrl:
@@ -221,7 +226,7 @@ algorithm:
   pf_ppo:
     reweight_method: pow
     weight_pow: 2.0
-  # Graph-RL agent setting
+  # agent setting (kept for compatibility; must stay false)
   no_think_rl: false
 
 trainer:
@@ -231,7 +236,7 @@ trainer:
   total_training_steps: 200
   project_name: ${oc.env:WAND_PROJECT,verl_examples}
   experiment_name: ${oc.env:EXPERIMENT_NAME,gsm8k}
-  logger: ['console', 'wandb']
+  logger: ['console']
   # Number of generations to log during validation
   log_val_generations: 0
   # Directory for logging rollout data; no dump if null
@@ -276,7 +281,7 @@ trainer:
   critic_warmup: 0
 
   # Default path to distributed filesystem for saving checkpoints
-  default_hdfs_dir: ${oc.env:OUTPUT_DIR,${oc.env:HOME}/experiments/gsm8k/ppo}/${trainer.experiment_name}
+  default_hdfs_dir: null
 
   # Whether to delete local checkpoints after loading
   del_local_ckpt_after_load: False
@@ -312,41 +317,41 @@ graph:
       dataset: dblp
       embed_cache_dir: ${oc.env:GRAPH_DIR,./data/graphs}/dblp
     maple_Biology:
-      graph_dir: ${oc.env:GRAPH_DIR}/maple/Biology/graph.json
+      graph_dir: ${oc.env:GRAPH_DIR,./data/graphs}/maple/Biology/graph.json
       dataset: maple
-      embed_cache_dir: ${oc.env:GRAPH_DIR}/maple/Biology
+      embed_cache_dir: ${oc.env:GRAPH_DIR,./data/graphs}/maple/Biology
     maple_Chemistry:
-      graph_dir: ${oc.env:GRAPH_DIR}/maple/Chemistry/graph.json
+      graph_dir: ${oc.env:GRAPH_DIR,./data/graphs}/maple/Chemistry/graph.json
       dataset: maple
-      embed_cache_dir: ${oc.env:GRAPH_DIR}/maple/Chemistry
+      embed_cache_dir: ${oc.env:GRAPH_DIR,./data/graphs}/maple/Chemistry
     maple_Medicine:
-      graph_dir: ${oc.env:GRAPH_DIR}/maple/Medicine/graph.json
+      graph_dir: ${oc.env:GRAPH_DIR,./data/graphs}/maple/Medicine/graph.json
       dataset: maple
-      embed_cache_dir: ${oc.env:GRAPH_DIR}/maple/Medicine
+      embed_cache_dir: ${oc.env:GRAPH_DIR,./data/graphs}/maple/Medicine
     maple_Materials_Science:
-      graph_dir: ${oc.env:GRAPH_DIR}/maple/Materials_Science/graph.json
+      graph_dir: ${oc.env:GRAPH_DIR,./data/graphs}/maple/Materials_Science/graph.json
       dataset: maple
-      embed_cache_dir: ${oc.env:GRAPH_DIR}/maple/Materials_Science
+      embed_cache_dir: ${oc.env:GRAPH_DIR,./data/graphs}/maple/Materials_Science
     maple_Physics:
-      graph_dir: ${oc.env:GRAPH_DIR}/maple/Physics/graph.json
+      graph_dir: ${oc.env:GRAPH_DIR,./data/graphs}/maple/Physics/graph.json
       dataset: maple
-      embed_cache_dir: ${oc.env:GRAPH_DIR}/maple/Physics
+      embed_cache_dir: ${oc.env:GRAPH_DIR,./data/graphs}/maple/Physics
     biomedical:
-      graph_dir: ${oc.env:GRAPH_DIR}/biomedical/graph.json
+      graph_dir: ${oc.env:GRAPH_DIR,./data/graphs}/biomedical/graph.json
       dataset: biomedical
-      embed_cache_dir: ${oc.env:GRAPH_DIR}/biomedical
+      embed_cache_dir: ${oc.env:GRAPH_DIR,./data/graphs}/biomedical
     # amazon:
-    #   graph_dir: ${oc.env:GRAPH_DIR}/amazon/graph.json
+    #   graph_dir: ${oc.env:GRAPH_DIR,./data/graphs}/amazon/graph.json
     #   dataset: amazon
-    #   embed_cache_dir: ${oc.env:GRAPH_DIR}/amazon
+    #   embed_cache_dir: ${oc.env:GRAPH_DIR,./data/graphs}/amazon
     # legal:
-    #   graph_dir: ${oc.env:GRAPH_DIR}/legal/graph.json
+    #   graph_dir: ${oc.env:GRAPH_DIR,./data/graphs}/legal/graph.json
     #   dataset: legal
-    #   embed_cache_dir: ${oc.env:GRAPH_DIR}legal 
+    #   embed_cache_dir: ${oc.env:GRAPH_DIR,./data/graphs}/legal
     # goodreads:
-    #   graph_dir: ${oc.env:GRAPH_DIR}/goodreads/graph.json
+    #   graph_dir: ${oc.env:GRAPH_DIR,./data/graphs}/goodreads/graph.json
     #   dataset: goodreads
-    #   embed_cache_dir: ${oc.env:GRAPH_DIR}/goodreads
+    #   embed_cache_dir: ${oc.env:GRAPH_DIR,./data/graphs}/goodreads
 
 max_turns: 10
 do_search: true

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Main entry for PPO-format training migrated from Graph-RL to latest VERL.
+Main entry for GraphDancer PPO training and evaluation (multi-turn graph agent).
 
 Notes:
 - Uses latest RayPPOTrainer from VERL.
@@ -33,7 +33,7 @@ from verl.utils.reward_score import qa_em, qa_em_format  # modules provided unde
 
 
 def _select_rm_score_fn(data_source):
-    # Datasets covered in Graph-RL format scoring
+    # Datasets scored with the format-aware exact-match reward (GRBench uses 'grbench')
     if data_source in [
         'nq',
         'triviaqa',
@@ -52,7 +52,10 @@ def _select_rm_score_fn(data_source):
 
 
 class RewardManager:
-    """Graph-RL style reward manager with format-aware EM scoring.
+    """Rule-based reward manager with format-aware EM scoring.
+
+    R = 0.8E + 0.2F + 0.1A(1-E)(1-F) with structure_format_score=0.2, final_format_score=0.1,
+    retrieval_score=0 (see verl.utils.reward_score.qa_em_format.compute_score_em).
 
     Implements both tensor-only return and return_dict API expected by VERL trainer.
     """
@@ -160,12 +163,11 @@ def main_task(config):
         from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
         from verl.single_controller.ray import RayWorkerGroup as RayWG
         ray_worker_group_cls = RayWG
-    elif config.actor_rollout_ref.actor.strategy == 'megatron':
-        from verl.workers.megatron_workers import ActorRolloutRefWorker, CriticWorker
-        from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup as RayWG
-        ray_worker_group_cls = RayWG
     else:
-        raise NotImplementedError
+        # GraphDancer's training entry point supports the FSDP / FSDP2 backends only.
+        raise NotImplementedError(
+            f"actor strategy {config.actor_rollout_ref.actor.strategy!r} is not supported; use fsdp or fsdp2"
+        )
 
     # Import ResourcePoolManager from latest ray_trainer
     from verl.trainer.ppo.ray_trainer import ResourcePoolManager

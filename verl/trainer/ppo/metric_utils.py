@@ -17,6 +17,7 @@ Metrics related to the PPO trainer.
 
 from collections import defaultdict
 from functools import partial
+import os
 from typing import Any, Callable
 
 import numpy as np
@@ -24,6 +25,56 @@ import torch
 
 from verl import DataProto
 from verl.utils.import_utils import deprecated
+
+
+@torch.no_grad()
+def compute_ppo_diagnostics(batch: DataProto, entropys: torch.Tensor) -> dict[str, float]:
+    """Opt-in pre-update diagnostics on generated tokens, with no gradient changes.
+
+    Log probabilities and full-vocabulary entropy use the rollout temperature.
+    The sampled log-ratio compares the pre-update actor to the original reference,
+    not the actor after this update. Top-k/top-p sampled trajectories do not give
+    an unbiased KL estimate. The existing k3 proxy also clips its log-ratio and
+    output; neither reported reference metric is an exact KL divergence.
+    """
+    if os.environ.get("GD_PPO_DIAGNOSTICS") != "1":
+        return {}
+
+    from verl.trainer.ppo.core_algos import kl_penalty
+
+    required = {"old_log_probs", "ref_log_prob", "response_mask", "info_mask", "attention_mask"}
+    missing = required.difference(batch.batch.keys())
+    if missing:
+        raise RuntimeError(f"PPO diagnostics missing required tensors: {sorted(missing)}")
+    mask = batch.batch["response_mask"]
+    if mask.ndim != 2 or not torch.all((mask == 0) | (mask == 1)):
+        raise RuntimeError("PPO diagnostics require a binary generated-token response_mask")
+    mask = mask.bool()
+    width = mask.shape[1]
+    info = batch.batch["info_mask"][:, -width:]
+    attention = batch.batch["attention_mask"][:, -width:]
+    if info.shape != mask.shape or attention.shape != mask.shape or \
+            not torch.equal(info, mask.to(info.dtype)) or torch.any(mask & ~attention.bool()):
+        raise RuntimeError("PPO diagnostics response_mask does not match generated-token info_mask")
+    if not mask.any():
+        raise RuntimeError("PPO diagnostics require at least one generated token")
+
+    selected = []
+    for name, values in (("old_log_probs", batch.batch["old_log_probs"]),
+                         ("ref_log_prob", batch.batch["ref_log_prob"]), ("entropys", entropys)):
+        if values is None or values.shape != mask.shape:
+            raise RuntimeError(f"PPO diagnostics require response-aligned {name}")
+        values = values.detach().float().masked_select(mask)
+        if not torch.isfinite(values).all():
+            raise RuntimeError(f"PPO diagnostics found nonfinite generated-token {name}")
+        selected.append(values)
+    actor, reference, entropy = selected
+    return {
+        "diagnostic/pre_update_ref_sampled_log_ratio": (actor - reference).mean().item(),
+        "diagnostic/pre_update_ref_k3_clipped_proxy": kl_penalty(actor, reference, "k3").mean().item(),
+        "diagnostic/pre_update_generated_entropy": entropy.mean().item(),
+        "diagnostic/generated_tokens": mask.sum().item(),
+    }
 
 
 @deprecated("verl.utils.metric.reduce_metrics")

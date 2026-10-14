@@ -139,7 +139,7 @@ class BaseCheckpointManager:
             print(f"Checkpoint manager remove previous save local path: {abs_path}")
             if not os.path.exists(abs_path):
                 continue
-            shutil.rmtree(abs_path, ignore_errors=True)
+            shutil.rmtree(abs_path)
 
     @staticmethod
     def get_rng_state():
