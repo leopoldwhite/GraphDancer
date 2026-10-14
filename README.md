@@ -13,14 +13,6 @@ GraphDancer: Training LLMs to Explore and Reason over Graphs via Curriculum Rein
 </p>
 <!--- BADGES: END --->
 
-> **Versions.** `main` holds the latest version of the paper, which uses single-stage curriculum
-> reinforcement learning; the arXiv page shows the earlier two-stage version until its v3 is posted.
-> The two-stage version (Curriculum-PPO followed by Curriculum-DPO) and its code are on the
-> [`two-stage`](https://github.com/leopoldwhite/GraphDancer/tree/two-stage) branch. The
-> [Hugging Face collection](https://huggingface.co/collections/yuyangbai/graphdancer) holds
-> Qwen2.5-3B Curriculum-PPO and Vanilla PPO checkpoints from the January 2026 version and a
-> mirror of the GRBench graphs.
-
 GraphDancer trains an LLM to interact with a text-attributed graph through a small set
 of graph functions, interleaving reasoning with information seeking, using single-stage
 PPO with a **graph-aware curriculum**. This repository contains the training and
