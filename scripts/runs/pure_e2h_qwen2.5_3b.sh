@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Optional: pure easy-to-hard Gaussian schedule without the biased mixture (eta = 0). Supported by the sampler; not one of the runs reported in the paper.
+# Pure E2H control (eta = 0): the easy-to-hard Gaussian schedule without the biased mixture.
 # Paths and resources come from scripts/train_ppo.sh (GRAPH_DIR, TRAIN_FILE, OUTPUT_DIR, ...);
 # extra Hydra overrides are passed through.
 set -euo pipefail
